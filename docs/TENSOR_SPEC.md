@@ -25,6 +25,7 @@ Contents
 12. Acceptance tests
 13. Usage inventory of the retained code
 14. Open decisions for the implementers
+15. Design notes: how the performance was obtained
 
 ---
 
@@ -337,19 +338,21 @@ Matrices are `tensorET<2,T>` and vectors are `tensorET<1,T>`. Errors
 |----------|----------|
 | `norm(A, B, int p)` | p-norm of `A - B` over all elements (`p >= 1`). |
 | `norm(A, B, "fro"/"inf"/...)` | named norms of `A - B`. |
-| `conjugateGradient(A, b, x0, maxIter = -1, tol = 1e-6)` | CG for SPD `A`. `maxIter < 0` means `n`. Stops when the residual norm is at most `tol` (absolute; document if relative). Returns `x`. |
+| `conjugateGradient(A, b, x0, maxIter = -1, tol = 1e-6)` | CG for SPD `A`. `maxIter < 0` means `n`. Stops when the absolute residual norm drops below `tol`; also stops (with a message on stderr) when `pᵀAp` falls below 1e-12 in absolute value, which on well-scaled problems means it has converged. Returns `x`. |
 | `gaussJordanElimination(A)` | Reduced row-echelon form of `A` (partial pivoting). |
 | `augmentMatrix(A, b)` | `[A | b]`. |
 | `gramSchmidtOrthogonalization(V)` | Matrix whose columns are an orthonormal basis of `V`'s columns, in order. |
 | `luDcmp(A, tol = 1e-12)` | `{L, U}` without pivoting, `A = L U`, unit-diagonal `L`. Throws if a pivot has absolute value at most `tol`. |
 | `luDcmpPivoted(A, tol)` | `{{L, U}, P}` with `P A = L U`, `P` a permutation matrix. |
-| `luDcmpPivotedTile(A)` | Same result, tiled/parallel algorithm for large `n`. |
-| `qrDecompositionTile(A)` | QR (Householder, blocked). Document the return convention (the removed version returned the factored matrix in place). |
+| `luDcmpPivotedTile(A)` | Declared in the removed header but **never implemented** (no definition existed). Optional; if provided, same result as `luDcmpPivoted`. |
+| `qrDecompositionTile(A)` | Thin QR of an `m x n` matrix. **Overwrites `A` with `Q`** (orthonormal columns) and **returns `R`** (`n x n`, upper triangular). Columns whose norm falls below 1e-12 are left as is (rank-deficient input is not handled). |
 | `luSolve(L, U, P, B)` | Solves `A X = B` for a matrix or vector `B`, given the factors of `luDcmpPivoted`. |
 | `lanczos(A, m, q0)` | Returns `{alpha (m), beta (m-1), Q (m x n)}`: tridiagonal coefficients and Krylov basis (with reorthogonalization) for symmetric `A`, starting at `q0`. |
 | `expm(A)` | Matrix exponential (scaling and squaring with a Padé approximant, or equivalent accuracy: relative error at most 1e-12 on well-conditioned inputs). |
 | `lobpcg(A, nev, X0, eigvals, X, maxIter = 100, tol = 1e-8)` | The `nev` smallest eigenpairs of symmetric `A` from the initial block `X0`. Writes `eigvals` (ascending) and `X` (columns = eigenvectors). |
-| `elimStep`, `revEl`, `matMul(history, A)`, `matMul(A, history)`, `inverse_backs(A, m = 4)` | A recorded-elimination matrix inverse. The elimination runs once as a sequence of row operations and permutations (`Op` = tagged union of `ElimOp{target_row, source_row, alpha}` and `PermOp{target_row, source_row}`), and the recorded sequence can be replayed on another matrix from the left or the right. `inverse_backs` returns `A^{-1}` by replaying the history on the identity. The pairwise ("binary") elimination order is what makes it parallel. `m` is a block-size hint. |
+| `inverse_backs(U, m = 4)` | Inverse of an **upper-triangular** `U` (`n` divisible by the block size `m`). This is what the fast benchmark numbers are for. It does not factor a general matrix. The removed version at `03a4c03` crashed (a product was written into an empty tensor); it must return an `n x n` result. |
+| `revEl(A, m)`, `elimStep(A, factor, pivot, m)` | Reduces `A` to upper-triangular form **in place** by pairwise ("tournament") elimination. For each pivot column, rows are paired at distances 1, 2, 4, …; in each pair the row with the larger entry in the pivot column is swapped to the top (2-way partial pivoting), and the lower row is eliminated against it. Every row operation is recorded and returned as a history (`Op` = tagged union of `ElimOp{target_row, source_row, alpha}` and `PermOp{target_row, source_row}`); `elimStep` does one level for one pivot. Entries whose magnitude is below 1e-10 times the pivot are flushed to zero. |
+| `matMul(history, A, m)`, `matMul(A, history, m)` | Replay a history on `A` from the left (row operations) or from the right (column operations), most recent operation first. **General inverse** = `revEl` on a copy of `A` giving `U` and history `H`, then `matMul(inverse_backs(U, m), H, m)`. It is correct (max error vs Eigen 1e-15 … 2e-12 for n = 64 … 512) but about 100x slower than Eigen in the removed version (§11.2). |
 
 Accuracy requirement for the factorizations and solves: on random
 well-conditioned matrices (condition number up to 1e3, `n` up to 2000), relative
@@ -436,50 +439,110 @@ Micro-targets (these explain regressions when the above misses):
 | pool: `allocate`+`deallocate` of a previously seen size | ≤ 2 µs host time, zero `cudaMalloc` calls (check with `nsys`) |
 | `read_element` on CUDA | one 8-byte transfer (≈10 µs); documented as slow |
 
-### 11.2 Tier 2: against Eigen 3.4 and PyTorch (CPU)
+### 11.2 Tier 2: measured baseline and targets
 
-Eigen with `-O3 -march=native`; with OpenMP where Eigen parallelizes (GEMM) and
-also without it. PyTorch: `torch.matmul` / `torch.linalg.inv` on CPU with its
-default thread count, float64. The GEMM, GEMV and inverse rows are set from the
-removed implementation's results, which beat both libraries, so the rewrite must
-not be slower than what existed. Reference harnesses that do not use the removed code are kept in
-`benchmarks/reference/` (`bench_eigen.cpp` for GEMM, `bench_gemv_eigen.cpp` for
-GEMV). Percentages are throughput relative to Eigen: 100 % means equal time, and
-higher is better.
+All numbers below were **measured** on 2026-09-25 (AC power) with the removed
+implementation at commit `03a4c03` (`feature/csr`). They use the old harnesses
+(`benchmarks/matops/bench_*.cpp`, `benchmarks/suite/tp_bench.cpp`) plus a
+comparison program that links the old code and Eigen into one binary. Setup:
+Eigen 3.4 (OpenMP where it parallelizes), PyTorch 2.12.1 CPU (best of 8 and 16
+threads, or 1 thread for the single-thread rows), g++ `-O3 -march=native
+-fopenmp`, OpenMP default 16 threads. Times are best or mean of 3–5 runs after a
+warm-up. **% = the other library's time / the old code's time** (above 100 %
+means the old code was faster).
 
-| Operation (sizes) | Target | Minimum acceptable |
-|-------------------|--------|--------------------|
-| fused element-wise `C = A + B * 2.0`, n = 1e6 … 1e8, 1 thread | 100 % | 90 % |
-| fused unary chain `C = exp(sin(A) + cos(A))`, n = 1e6, 1 thread | 100 % (same libm) | 85 % |
-| same, OpenMP (Eigen single-threaded) | ≥ 400 % | 250 % |
-| `matMulBlocked` GEMM, n = 1024 … 4096, OpenMP both | ≥ 101 % of Eigen **and** of PyTorch | 100 % of both |
-| `matMulBlocked` GEMM, n = 256, OpenMP both | ≥ 101 % of Eigen and PyTorch | 90 % |
-| GEMM, 1 thread, n = 1024 | ≥ 101 % | 100 % |
-| GEMV (`matMulBlocked` with a 1-column B, or a dedicated routine), n = 4096 | ≥ 101 % of Eigen **and** of PyTorch | 100 % of both |
-| `luDcmpPivoted`/`luDcmpPivotedTile` vs `PartialPivLU`, n = 1000 … 4000 | 70 % | 40 % |
-| `luSolve`, one RHS, n = 2000 | 90 % | 60 % |
-| `inverse_backs` vs `Eigen::inverse()` (OpenMP both), n = 1024 … 4096 | ≥ 300 % | 200 % |
-| `qrDecompositionTile` vs `HouseholderQR`, n = 1000 … 2000 | 70 % | 40 % |
-| `conjugateGradient` per iteration, n = 2000 dense SPD | 90 % of Eigen `ConjugateGradient` on the same dense matrix | 70 % |
-| `expm` vs `Eigen::MatrixExponential` (unsupported module), n = 200 | 80 % | 50 % |
+**Rule for the targets:** the minimum acceptable is the old result (no
+regression). The target is at least 101 % of the faster of Eigen and PyTorch.
+Where the old code was far behind, the target is Eigen parity and the old
+result is only the floor.
 
-Single-thread dense kernels should reach at least 60 % of the core's FP64
-peak for GEMM (AVX-512 FMA; the CPU LDLᵀ kernel in `src/sparse/dense_ldl.h` shows about
-49 GFLOPS per core is achievable on this machine).
+#### GEMM, `matMulBlocked` (best block size of 32/64/128), square n x n
 
-Baseline of the removed implementation. The first values are as recalled by the
-team; confirm them on AC power by building the old harnesses
-(`benchmarks/matops/benchmark_matops.py`, `benchmark_inverse.py`) at commit
-`03a4c03`, branch `feature/csr`, where the old code still exists, and record the
-sizes. If the measurements come out higher, raise the targets above to match.
+| prec | threads | n | old ms | Eigen ms | PyTorch ms | vs Eigen | vs PyTorch |
+|------|---------|---|--------|----------|------------|----------|------------|
+| f64 | 16 | 256 | 0.08 | 0.18 | 0.18 | 215 % | 220 % |
+| f64 | 16 | 512 | 1.13 | 2.04 | 0.90 | 181 % | 80 % |
+| f64 | 16 | 1024 | 5.65 | 16.7 | 9.15 | 296 % | 162 % |
+| f64 | 16 | 2048 | 46.4 | 66.6 | 60.6 | 144 % | 131 % |
+| f64 | 16 | 3072 | 157 | 138 | 173 | 88 % | 111 % |
+| f64 | 16 | 4096 | 373 | 313 | 430 | 84 % | 115 % |
+| f64 | 1 | 256 | 0.60 | 0.59 | 0.69 | 99 % | 115 % |
+| f64 | 1 | 1024 | 42.0 | 35.6 | 40.5 | 85 % | 96 % |
+| f64 | 1 | 2048 | 397 | 273 | 310 | 69 % | 78 % |
+| f32 | 16 | 256 | 0.04 | 0.11 | 0.06 | 264 % | 153 % |
+| f32 | 16 | 1024 | 2.36 | 2.16 | 2.53 | 92 % | 107 % |
+| f32 | 16 | 2048 | 21 ± 1 | 20 ± 1 | 35.3 | ≈ 95 % | 124 % |
+| f32 | 16 | 4096 | 168 | 197 | 205 | 118 % | 123 % |
+| f32 | 1 | 2048 | 230 | 134 | 159 | 58 % | 69 % |
 
-| Operation | old / Eigen | old / PyTorch | source |
-|-----------|-------------|---------------|--------|
-| GEMM (`matMulBlocked`), OpenMP | ≥ 101 % | ≥ 101 % | recalled, to confirm |
-| GEMV (`matMulBlocked`) | ≥ 101 % | ≥ 101 % | recalled, to confirm |
-| `inverse_backs`, OpenMP | 200 … 300 % | n/a | recalled, to confirm |
-| element-wise fused (n = 1e7) | _pending_ | _pending_ | |
-| pivoted LU n = 2000 | _pending_ | _pending_ | |
+The other old GEMM paths (`matMulTile`, lazy `matMul`) are much slower
+(f64, 16 threads, n = 1024: tiled 34.5 ms, lazy 6.7 s). They exist for generality,
+not speed.
+
+Targets: ≥ 101 % of the faster of Eigen/PyTorch at every size and thread count
+above. Minimum: the old column. The known gaps are n ≥ 3072 and single thread;
+§15.2 explains why and how to close them.
+
+#### GEMV, y = A x, n x n (f64)
+
+| threads | n | best old kernel ms | Eigen ms | PyTorch ms | vs Eigen | vs PyTorch | library `matMulTile` ms |
+|---------|---|--------------------|----------|------------|----------|------------|--------------------------|
+| 16 | 4096 | 2.82 | 3.47 | 4.40 | 123 % | 156 % | 7.67 |
+| 16 | 8192 | 10.7 | 12.1 | 15.6 | 113 % | 145 % | 23.5 |
+| 16 | 16384 | 39.3 | 47.2 | 62.0 | 120 % | 158 % | 73.1 |
+| 1 | 4096 | 4.93 | 3.33 | 4.30 | 67 % | 87 % | 33.1 |
+| 1 | 16384 | 80.8 | 47.4 | 65.4 | 59 % | 81 % | 562 |
+
+The fast GEMV kernels lived only in the benchmark programs; the library's
+matrix-vector path was `matMulTile` (last column). f32 behaves the same (16
+threads: 110–149 % of Eigen). Target: a library GEMV at ≥ 101 % of Eigen and
+PyTorch with threads, and at least Eigen parity single-threaded. GEMV is
+memory-bound, so this means running at the machine's memory bandwidth.
+
+#### Triangular inverse, `inverse_backs` (upper triangular, f64, 16 threads)
+
+| n | old ms (best m) | Eigen triangular solve with I | PyTorch `solve_triangular` | Eigen general `inverse()` | PyTorch general `inv` |
+|---|-----------------|-------------------------------|----------------------------|---------------------------|-----------------------|
+| 512 | 1.04 | 3.93 ms (378 %) | 0.68 ms (65 %) | 20.3 ms (1954 %) | 3.19 ms (307 %) |
+| 1024 | 4.15 | 26.3 ms (634 %) | 5.99 ms (144 %) | 110 ms (2645 %) | 17.0 ms (409 %) |
+| 2048 | 31.7 | 183 ms (576 %) | 41.8 ms (132 %) | 716 ms (2256 %) | 121 ms (380 %) |
+| 4096 | 156 | 1276 ms (817 %) | 283 ms (181 %) | 4177 ms (2676 %) | 750 ms (480 %) |
+
+The earlier "200–300 %" came from comparing against the general inverse. The fair
+comparison is the triangular one, and the old code wins it from n = 1024 up.
+Targets: ≥ 101 % of the faster triangular solve (PyTorch) at every size, which
+closes the n = 512 gap. Minimum: the old column.
+
+The **general inverse** built from the history (`revEl` + `inverse_backs` +
+replay) was correct but slow: n = 256: 347 ms vs Eigen 1.9 ms; n = 512: 1400 ms vs
+16.8 ms. Target: Eigen parity (see §15.4 for how).
+
+#### Everything else (f64; Eigen and PyTorch as noted)
+
+| Operation | n | old | Eigen | PyTorch (8 thr) | old vs Eigen |
+|-----------|---|-----|-------|-----------------|--------------|
+| `C = A + B` (1 thread) | 1e7 | 7.07 ms | 7.03 ms | 8.01 ms | 99 % |
+| `C = A + B * 2.0` | 1e7 | 7.22 ms | 7.05 ms | 7.76 ms | 98 % |
+| `C = exp(sin(A) + cos(A))` | 1e6 | 9.86 ms | 9.81 ms | 2.00 ms | 99 % |
+| `C = sqrt(A)` | 1e7 | 19.8 ms | 4.80 ms | 5.71 ms | 24 % |
+| `luDcmpPivoted` | 500 / 1000 / 2000 | 16.3 / 142 / 1860 ms | 2.1 / 7.7 / 38.1 ms | 0.53 / 2.1 / 18.4 ms | 13 / 5 / 2 % |
+| `luSolve`, 1 rhs | 1000 / 2000 | 1.45 / 6.02 ms | 0.11 / 0.88 ms | 0.14 / 1.03 ms | 8 / 15 % |
+| `qrDecompositionTile` | 500 / 1000 | 20.9 / 165 ms | 4.0 / 25.9 ms | 2.2 / 12.1 ms | 19 / 16 % |
+| `conjugateGradient`, per iteration | 2000 | 3.5 ms | 0.62 ms | – | 18 % |
+| `expm` | 100 / 200 | 1.97 / 15.8 ms | 0.30 / 1.35 ms | 0.31 / 0.60 ms | 15 / 9 % |
+| `gaussJordanElimination` (suite) | 512 | 35.5 ms | – | – | – |
+| transpose (suite) | 2048 | 60 ms | – | – | – |
+
+The element-wise rows are single-threaded on both sides. PyTorch is multi-threaded,
+so it wins the compute-bound chain by 5x; the old assignment loop had no threading.
+Targets: element-wise ≥ 100 % of Eigen single-threaded and ≥ 101 % of PyTorch
+threaded (the assignment must parallelize above a size threshold). The rest must
+reach Eigen parity; the old values are only the floor. `expm` inherits the GEMM
+speed once it uses the fast product. Transpose must run at least at half of copy
+bandwidth.
+
+Raw results: `benchmarks/reference/RESULTS_OLD_DENSE.md` (tables above plus the
+float rows and every block size).
 
 ## 12. Acceptance tests
 
@@ -531,4 +594,181 @@ Nothing else in §5–§10 is used by the retained code.
 - Seeds for `uniform`/`gaussian` (§5.9).
 - Whether the placeholder assignment (§5.10) and the domain constructor
   (§5.3, §5.7) are worth keeping.
-- `qrDecompositionTile`'s return convention (§7).
+
+## 15. Design notes: how the performance was obtained
+
+This section explains how the removed implementation got the §11.2 numbers,
+where it lost performance, and what a rewrite should do. It gives ideas and
+parameters, not code. The retained `src/sparse/dense_ldl.h` (a packed,
+register-blocked `L D Lᵀ` update written for this project, not part of the
+removed code) is a working in-tree example of the kernel techniques in §15.2 and
+may be read freely.
+
+### 15.1 Expression templates (element-wise math)
+
+- **Static polymorphism via CRTP.** Every expression node (a tensor, a
+  sum, a scalar product, `exp(...)`, …) derives from a common base template that
+  is parameterized on the node's own type. The operators and math functions accept
+  "anything derived from the base", then downcast statically to the concrete type.
+  There are no virtual functions and no runtime graph: the full expression tree
+  is a single C++ type known at compile time.
+- **Nodes are tiny and hold references.** A binary node stores const
+  references to its two operands (a scalar node stores the scalar by value); it
+  owns no data. Building `A + B * 2.0` allocates nothing.
+- **Evaluation is pull-based per element.** Each node answers `value(i)` by
+  asking its children for `value(i)` and combining them. Assignment to a tensor is
+  one loop over `i` that calls the root's `value(i)`. With everything inlined, the
+  compiler flattens the tree into a single loop body and vectorizes it. This is
+  why the old code matched Eigen (98–99 %) on `A + B`, `A + B * 2` and the
+  `exp(sin + cos)` chain.
+- **Where it lost:**
+  - The assignment loop was single-threaded; add an OpenMP split above roughly
+    32–64 K elements. This is how PyTorch won the compute-bound chain by 5x.
+  - `sqrt` ran at about 20 % of Eigen because the scalar `std::sqrt` call with
+    `errno` semantics blocks vectorization. Use `-fno-math-errno`, or map
+    `sqrt` (and `fabs`, `min`, `max`) to vector instructions explicitly.
+  - Transcendentals rely on libm auto-vectorization (glibc `libmvec`), which is
+    what makes `exp/sin/cos` competitive. Keep the loop simple enough that the
+    compiler still emits the vector calls.
+- **Aliasing:** `A = A + B` is safe element-wise because element `i` depends
+  only on inputs at `i`. The lazy `matMul` is not element-local and must not be
+  assigned to one of its own operands.
+
+### 15.2 GEMM (`matMulBlocked`)
+
+What made it beat Eigen and PyTorch up to n ≈ 2048 with threads:
+
+1. **Square tiling of the output.** C is cut into m x m tiles (m = 64 was best
+   up to n = 1024, and m = 128 at n ≥ 2048). **Each output tile is one parallel
+   task**, and the tiles are handed out dynamically. The task loops over all k
+   tiles and accumulates into a thread-private m x m buffer, then writes the tile
+   back once. No two threads ever write the same part of C, so there are no
+   reductions or atomics. The fused `alpha`/bias epilogue is applied to the
+   private buffer before the write-back.
+2. **Packing.** For each (i, k) and (k, j) step, the A and B tiles are copied
+   into 64-byte-aligned, contiguous m x m buffers. The copy zero-pads edges and
+   applies a requested transpose during packing, so the kernel only ever sees
+   aligned, unit-stride, square data.
+3. **Register-blocked micro-kernel.** The f64 AVX-512 inner kernel keeps a
+   **4-row x 16-column block of C in 8 zmm registers** for the whole k loop.
+   Each step loads two vectors of a B row, broadcasts four A elements (one per
+   row) and issues 8 FMAs, then stores the block once at the end. The f32 kernel
+   has the same shape (16 lanes per vector). AVX2 and scalar fallbacks are chosen
+   by tile size (m ≥ 64 and a multiple of 16 for f64 AVX-512).
+4. **Compile-time dispatch** on element type and ISA (`if constexpr` plus
+   preprocessor feature tests), so there is no runtime branching in the hot loop.
+
+Why it fell to 84–88 % of Eigen at n ≥ 3072, and to 58–85 % single-threaded:
+
+- **Every output tile re-packs its whole row of A tiles and column of B
+  tiles.** Total packing traffic grows as n³/m instead of n². Eigen and GotoBLAS
+  pack a B panel once and reuse it across all row blocks.
+- **Three `malloc`/`free` calls per tile task** (a heap allocation inside the
+  parallel loop).
+- **The micro-tile is small.** 4 x 16 f64 is 8 accumulators, while AVX-512 has
+  32 registers. A wider tile (for example 8 x 24 or 12 x 16) raises the FMA to
+  load ratio. `dense_ldl.h` uses 24 x 8 with KC = 256.
+- **One tile size m serves as cache block, micro-kernel shape and task size
+  at once.** A rewrite should separate these:
+  - an MC x KC block of A kept in L2;
+  - a KC x NC panel of B kept in L3 and shared by all threads;
+  - an MR x NR register tile;
+  - tasks formed over the MC blocks inside one NC panel.
+  Keep the "one task owns one C region" property, which is what made it scale.
+- **Square-only, n divisible by m.** Rectangular shapes and remainder tiles
+  should be handled without falling back to the scalar kernel.
+
+### 15.3 GEMV
+
+GEMV is memory-bound: the matrix is read once. The fastest old kernels, which
+lived only in benchmark programs:
+
+- split **rows** across threads (contiguous row ranges, static schedule);
+- for each row, run a dot product over the contiguous row with **several
+  independent vector accumulators** (4 zmm), combining them only at the end;
+  a single accumulator is latency-bound on the FMA chain.
+
+That reached 113–123 % of Eigen with threads. Single-threaded it reached only
+57–67 %: one core cannot saturate memory bandwidth, and Eigen single-threaded
+processes several rows at once to reuse the `x` loads. A rewrite should:
+- do several rows per pass (4–8) to amortize loading `x`;
+- prefetch;
+- make the **library** GEMV (and `matMulTile` with a vector) use this kernel. The
+  old library path was 2–10x slower than the benchmark kernel.
+
+### 15.4 Inverses
+
+**Upper-triangular inverse (`inverse_backs`), 3.8–8x Eigen, 1.3–1.8x PyTorch:**
+
+1. Invert all m x m diagonal blocks **independently in parallel** (small dense
+   triangular inverses).
+2. Then, for each block column j, **in parallel over j**, go up the column:
+   `X_ij = −X_ii · Σ_{k=i+1..j} A_ik X_kj`. The block products use the fast GEMM.
+   Block columns are independent, so the parallelism is embarrassing. The work
+   is about n³/3 flops, all in GEMM.
+3. It beats Eigen and PyTorch because they solve U X = I as a general
+   triangular solve with a dense right-hand side. They do not exploit that the
+   result is triangular (half the work), and Eigen 3.4 only threads its GEMM, not
+   its triangular solve. The n = 512 loss to PyTorch is probably from too few
+   block columns for 16 threads plus the GEMM re-packing overhead of §15.2
+   (not profiled).
+
+**General inverse:** the old path (tournament elimination with a recorded
+history, then `inverse_backs`, then replaying the history) was ~100x slower than
+Eigen. Every recorded row operation became a separate OpenMP parallel region
+over column blocks, with heap-allocated tile buffers per operation: about n²
+parallel regions for an n x n matrix. The pairwise elimination idea is
+numerically fine (2-way partial pivoting, errors 1e-15 … 1e-12). Its execution
+granularity is the problem. To reach Eigen parity:
+- factor with a **blocked, right-looking LU**: a panel factorization of m
+  columns, a triangular solve for the block row, and a GEMM trailing update
+  (> 90 % of the flops in the fast GEMM);
+- then either invert `U` with the `inverse_backs` scheme and `L` with its lower
+  mirror, and multiply (`A⁻¹ = U⁻¹ L⁻¹ P`), or solve `A X = I` with blocked
+  triangular solves that skip the known-zero part of the right-hand side;
+- if the recorded-history replay is kept for other uses, apply the operations
+  in **batches** (all ops of one elimination level touch disjoint row pairs and
+  can go in one parallel pass), not one parallel region per operation.
+
+### 15.5 Factorizations, CG, expm
+
+The old implementations were textbook scalar algorithms (floors in §11.2). What
+to build instead:
+
+- **LU (2–13 % of Eigen):** it was unblocked and serial. It also swapped rows in
+  full `L`, `U` and `P` matrices. Use the blocked right-looking scheme of §15.4,
+  store the permutation as a vector, and keep `P` as a matrix only in the
+  public result.
+- **luSolve (8–15 %):** forward/back substitution on the dense `L`/`U`
+  matrices with a permutation-matrix multiply. Apply the permutation as an
+  index vector, and use row-major substitution with vectorized dot products.
+- **QR (16–19 %):** tiled modified Gram–Schmidt (column by column). Use
+  blocked Householder with the compact-WY representation, so most of the work
+  becomes GEMM. This changes the numerics (better orthogonality) but not the
+  interface (A becomes Q, R is returned).
+- **CG (18 % per iteration):** each iteration allocated a new vector for
+  `A p` and used the slow matrix-vector path. Preallocate all work vectors and use
+  the fast GEMV; fuse the vector updates (`x += αp`, `r −= αAp`, `rᵀr`) into one
+  pass.
+- **expm (9–15 %):** scaling and squaring with a degree-13 Padé approximant
+  (Higham's method), with the 1-norm choosing the scaling. The algorithm is the
+  right one; the time goes into its ~6 matrix products, the LU solve and the
+  squarings, all on the slow paths. With the fast GEMM and blocked LU it reaches
+  Eigen parity.
+- **Lanczos / LOBPCG:** Lanczos with DGKS re-orthogonalization. LOBPCG solves
+  the Rayleigh–Ritz step with a Jacobi eigensolver on the small Gram matrix.
+  Both are dominated by GEMV/GEMM and inherit their speed.
+
+### 15.6 Memory and threading conventions
+
+- Never allocate inside a parallel loop or per task. Give each thread its
+  packing and scratch buffers once per call; `thread_local` buffers that grow
+  on demand are fine.
+- Aligned (64-byte) packing buffers, unaligned loads on user tensors.
+- Use one OpenMP parallel region per operation with work-sharing inside,
+  rather than one region per small step (see §15.4).
+- Parallelize only above a work threshold. For example `dense_ldl.h` gates on
+  about 2e6 flops; smaller problems run serially to avoid fork/join cost.
+- **Transpose** (60 ms at n = 2048, about 1 GB/s of read + write traffic): use cache-tiled 32 x 32 or
+  64 x 64 blocks, in parallel over tiles. The target is at least half of copy
+  bandwidth.
