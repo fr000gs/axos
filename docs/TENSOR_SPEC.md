@@ -436,10 +436,13 @@ Micro-targets (these explain regressions when the above misses):
 | pool: `allocate`+`deallocate` of a previously seen size | ≤ 2 µs host time, zero `cudaMalloc` calls (check with `nsys`) |
 | `read_element` on CUDA | one 8-byte transfer (≈10 µs); documented as slow |
 
-### 11.2 Tier 2: against Eigen 3.4
+### 11.2 Tier 2: against Eigen 3.4 and PyTorch (CPU)
 
 Eigen with `-O3 -march=native`; with OpenMP where Eigen parallelizes (GEMM) and
-also without it. Reference harnesses that do not use the removed code are kept in
+also without it. PyTorch: `torch.matmul` / `torch.linalg.inv` on CPU with its
+default thread count, float64. The GEMM, GEMV and inverse rows are set from the
+removed implementation's results, which beat both libraries, so the rewrite must
+not be slower than what existed. Reference harnesses that do not use the removed code are kept in
 `benchmarks/reference/` (`bench_eigen.cpp` for GEMM, `bench_gemv_eigen.cpp` for
 GEMV). Percentages are throughput relative to Eigen: 100 % means equal time, and
 higher is better.
@@ -449,13 +452,13 @@ higher is better.
 | fused element-wise `C = A + B * 2.0`, n = 1e6 … 1e8, 1 thread | 100 % | 90 % |
 | fused unary chain `C = exp(sin(A) + cos(A))`, n = 1e6, 1 thread | 100 % (same libm) | 85 % |
 | same, OpenMP (Eigen single-threaded) | ≥ 400 % | 250 % |
-| `matMulBlocked` GEMM, n = 1024 … 4096, OpenMP both | 90 % | 70 % |
-| `matMulBlocked` GEMM, n = 256, OpenMP both | 70 % | 50 % |
-| GEMM, 1 thread, n = 1024 | 90 % | 70 % |
-| GEMV (`matMulBlocked` with a 1-column B, or a dedicated routine), n = 4096 | 90 % | 75 % |
+| `matMulBlocked` GEMM, n = 1024 … 4096, OpenMP both | ≥ 101 % of Eigen **and** of PyTorch | 100 % of both |
+| `matMulBlocked` GEMM, n = 256, OpenMP both | ≥ 101 % of Eigen and PyTorch | 90 % |
+| GEMM, 1 thread, n = 1024 | ≥ 101 % | 100 % |
+| GEMV (`matMulBlocked` with a 1-column B, or a dedicated routine), n = 4096 | ≥ 101 % of Eigen **and** of PyTorch | 100 % of both |
 | `luDcmpPivoted`/`luDcmpPivotedTile` vs `PartialPivLU`, n = 1000 … 4000 | 70 % | 40 % |
 | `luSolve`, one RHS, n = 2000 | 90 % | 60 % |
-| `inverse_backs` vs `Eigen::inverse()` (OpenMP both), n = 1024 … 4096 | 100 % | 60 % |
+| `inverse_backs` vs `Eigen::inverse()` (OpenMP both), n = 1024 … 4096 | ≥ 300 % | 200 % |
 | `qrDecompositionTile` vs `HouseholderQR`, n = 1000 … 2000 | 70 % | 40 % |
 | `conjugateGradient` per iteration, n = 2000 dense SPD | 90 % of Eigen `ConjugateGradient` on the same dense matrix | 70 % |
 | `expm` vs `Eigen::MatrixExponential` (unsupported module), n = 200 | 80 % | 50 % |
@@ -464,18 +467,19 @@ Single-thread dense kernels should reach at least 60 % of the core's FP64
 peak for GEMM (AVX-512 FMA; the CPU LDLᵀ kernel in `src/sparse/dense_ldl.h` shows about
 49 GFLOPS per core is achievable on this machine).
 
-Baseline for the removed implementation (to be filled in on AC power by
-building the benchmark harnesses at commit `03a4c03`, branch `feature/csr`,
-where the old code still exists; this records where the old code stood and does
-not raise the targets above):
+Baseline of the removed implementation. The first values are as recalled by the
+team; confirm them on AC power by building the old harnesses
+(`benchmarks/matops/benchmark_matops.py`, `benchmark_inverse.py`) at commit
+`03a4c03`, branch `feature/csr`, where the old code still exists, and record the
+sizes. If the measurements come out higher, raise the targets above to match.
 
-| Operation | old / Eigen | measured on |
-|-----------|-------------|-------------|
-| element-wise fused (n = 1e7) | _pending_ | |
-| GEMM n = 2048 OpenMP | _pending_ | |
-| GEMV n = 4096 | _pending_ | |
-| pivoted LU n = 2000 | _pending_ | |
-| inverse_backs n = 2048 | _pending_ | |
+| Operation | old / Eigen | old / PyTorch | source |
+|-----------|-------------|---------------|--------|
+| GEMM (`matMulBlocked`), OpenMP | ≥ 101 % | ≥ 101 % | recalled, to confirm |
+| GEMV (`matMulBlocked`) | ≥ 101 % | ≥ 101 % | recalled, to confirm |
+| `inverse_backs`, OpenMP | 200 … 300 % | n/a | recalled, to confirm |
+| element-wise fused (n = 1e7) | _pending_ | _pending_ | |
+| pivoted LU n = 2000 | _pending_ | _pending_ | |
 
 ## 12. Acceptance tests
 
