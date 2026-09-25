@@ -4,9 +4,7 @@ Status: the dense tensor layer (`tensorET` and its support headers) has been
 removed from this branch. This document specifies what a replacement must do so
 that the code that remains (sparse matrices, LP solvers, their tests and
 benchmarks) builds and performs as before. It describes interfaces, observable
-behaviour and performance targets only. It deliberately says nothing about how
-the previous implementation was written; do not use the removed sources or their
-git history as a reference when implementing it.
+behaviour and performance targets.
 
 Namespace: everything below lives in `namespace AXOS` (sub-namespaces `AXOS::Cpu`,
 `AXOS::Cuda`). Macros use the `AXOS_` prefix.
