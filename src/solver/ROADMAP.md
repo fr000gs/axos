@@ -346,6 +346,24 @@ MIPLIB 2017 "easy" instances, and a fixed list of small instances solves to
 proven optimality. Every incumbent is checked for feasibility on the
 original (non-presolved) model.
 
+**Status: milestone 1 done** (`src/solver/milp/milp.h`, `solve_milp`). Plain branch and
+bound on the dual simplex: `DualSimplex::prepare()` once + `resolve()` per node
+(warm start from the parent basis), best-first with plunging, pseudocost branching,
+activity-based bound propagation at every node, incumbent cutoff (whole-unit when the
+objective is integral), reduced-cost fixing, rounding and fractional diving, every
+incumbent verified on the original model. Correct against enumeration on 115 random
+small programs (pure integer, mixed, infeasible) and against HiGHS on 8 of 12
+MIPLIB-1 models from the HiGHS repository. Weak where presolve and cuts decide:
+p0548 (incumbent 4x optimum, bound 8392 of 8691 after 60 s), gesa2 (1.2% gap), egout
+(83k nodes vs 1). Node throughput is not the problem (bell5: 24k nodes/s).
+Next, in this order of expected payoff: (1) MIP-safe presolve (singleton rows, activity
+bounds, coefficient tightening of big-M rows, implied integers; NOT dual fixing /
+aggregation / column merging of integer columns), (2) root cuts (knapsack cover, MIR,
+Gomory from the tableau) with `Csr::append_rows`, (3) more heuristics (feasibility
+pump, RINS) and restarts, (4) reliability branching, (5) an LP presolve-free but
+Auto-solved root for large instances (needs crossover to get a basis), (6) parallel
+tree search.
+
 ## Stage 3: QP (convex)
 
 Needs: 1c interior point, Stage 0-C (factorization).

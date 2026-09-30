@@ -1324,6 +1324,214 @@ test_concurrent_auto(const char *cat)
     }
 }
 
+// ─── MILP ───────────────────────────────────────────────────────────────────
+// Reference values come from enumeration (pure integer problems) or enumeration
+// of the integer part plus an LP for the continuous part (mixed problems).
+static void
+test_milp()
+{
+    const char *cat = "SOLVER_MILP";
+    auto ints = [](LpProblem &p, std::initializer_list<int> cols) {
+        p.is_integer.assign(p.cols(), 0);
+        for (int j : cols) p.is_integer[j] = 1;
+    };
+    // the classic textbook problem: max 5x + 4y + 3z, optimum 13 at (2, 0, 1)
+    {
+        LpBuilder b(3, 3);
+        b.a(0, 0, 2).a(0, 1, 3).a(0, 2, 1).a(1, 0, 4).a(1, 1, 1).a(1, 2, 2)
+            .a(2, 0, 3).a(2, 1, 4).a(2, 2, 2);
+        b.p.c = {-5, -4, -3};
+        b.p.row_ub = {5, 11, 8};
+        b.p.col_ub = {kInf, kInf, kInf};
+        LpProblem p = b.build();
+        ints(p, {0, 1, 2});
+        MilpSolution s = solve_milp(p);
+        tlog(cat, "textbook integer program", s.status == MilpStatus::Optimal && near(s.objective, -13) &&
+            near_vec(s.x, {2, 0, 1}), std::abs(s.objective + 13), s.seconds * 1000,
+            to_string(s.status));
+    }
+    // infeasible only through integrality: 2x = 1
+    {
+        LpBuilder b(1, 1);
+        b.a(0, 0, 2);
+        b.p.c = {1};
+        b.p.row_lb = b.p.row_ub = {1};
+        b.p.col_ub = {10};
+        LpProblem p = b.build();
+        ints(p, {0});
+        MilpSolution s = solve_milp(p);
+        tlog(cat, "integer infeasible (2x = 1)", s.status == MilpStatus::Infeasible, 0, 0, to_string(s.status));
+    }
+    // LP relaxation unbounded
+    {
+        LpBuilder b(1, 2);
+        b.a(0, 0, 1).a(0, 1, -1);
+        b.p.c = {-1, -1};
+        b.p.row_ub = {3};
+        b.p.col_ub = {kInf, kInf};
+        LpProblem p = b.build();
+        ints(p, {0, 1});
+        MilpSolution s = solve_milp(p);
+        tlog(cat, "unbounded relaxation reported", s.status == MilpStatus::Unbounded, 0, 0, to_string(s.status));
+    }
+    // random multi-dimensional 0/1 knapsacks against enumeration
+    {
+        std::mt19937 g(91);
+        std::uniform_int_distribution<int> w(1, 20), v(1, 30);
+        bool ok = true;
+        double worst = 0;
+        long nodes = 0;
+        for (int trial = 0; trial < 25; ++trial) {
+            const int n = 14, m = 3;
+            LpBuilder b(m, n);
+            std::vector<std::vector<int>> A(m, std::vector<int>(n));
+            std::vector<int> cap(m), val(n);
+            for (int j = 0; j < n; ++j) val[j] = v(g);
+            for (int i = 0; i < m; ++i) {
+                int tot = 0;
+                for (int j = 0; j < n; ++j) { A[i][j] = w(g); tot += A[i][j]; b.a(i, j, A[i][j]); }
+                cap[i] = tot / 3;
+                b.p.row_ub[i] = cap[i];
+            }
+            for (int j = 0; j < n; ++j) { b.p.c[j] = -val[j]; b.p.col_ub[j] = 1; }
+            LpProblem p = b.build();
+            ints(p, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13});
+            long best = 0;
+            for (int mask = 0; mask < (1 << n); ++mask) {
+                bool f = true;
+                for (int i = 0; i < m && f; ++i) {
+                    int s = 0;
+                    for (int j = 0; j < n; ++j) if (mask >> j & 1) s += A[i][j];
+                    f = s <= cap[i];
+                }
+                if (!f) continue;
+                long s = 0;
+                for (int j = 0; j < n; ++j) if (mask >> j & 1) s += val[j];
+                best = std::max(best, s);
+            }
+            MilpOptions mo;
+            mo.mip_gap = 0; mo.abs_gap = 1e-9;
+            MilpSolution s = solve_milp(p, mo);
+            nodes += s.nodes;
+            const double e = std::abs(s.objective + static_cast<double>(best));
+            worst = std::max(worst, e);
+            ok = ok && s.status == MilpStatus::Optimal && e < 1e-6;
+        }
+        tlog(cat, "25 random knapsacks == enumeration", ok, worst, 0, (std::to_string(nodes) + " nodes").c_str());
+    }
+    // random general-integer problems (incl. equalities, some infeasible) against enumeration
+    {
+        std::mt19937 g(92);
+        std::uniform_int_distribution<int> coef(-4, 6), cost(-6, 6), rhs(2, 14);
+        bool ok = true;
+        int feasible_count = 0, infeasible_count = 0;
+        for (int trial = 0; trial < 60; ++trial) {
+            const int n = 5, m = 3, R = 3; // x_j in [0, R]
+            LpBuilder b(m, n);
+            std::vector<std::vector<int>> A(m, std::vector<int>(n));
+            std::vector<int> c(n), lo(m), hi(m);
+            for (int i = 0; i < m; ++i) {
+                for (int j = 0; j < n; ++j) { A[i][j] = coef(g); if (A[i][j]) b.a(i, j, A[i][j]); }
+                const int r = rhs(g);
+                if (i == 0 && trial % 3 == 0) { lo[i] = hi[i] = r; } // an equality
+                else { lo[i] = -1000; hi[i] = r; }
+                b.p.row_lb[i] = lo[i] == -1000 ? -kInf : lo[i];
+                b.p.row_ub[i] = hi[i];
+            }
+            for (int j = 0; j < n; ++j) { c[j] = cost(g); b.p.c[j] = c[j]; b.p.col_ub[j] = R; }
+            LpProblem p = b.build();
+            ints(p, {0, 1, 2, 3, 4});
+            long best = 1L << 40;
+            std::vector<int> x(n);
+            for (int code = 0; code < 1024; ++code) {
+                int t = code;
+                for (int j = 0; j < n; ++j) { x[j] = t % 4; t /= 4; }
+                bool f = true;
+                for (int i = 0; i < m && f; ++i) {
+                    int s = 0;
+                    for (int j = 0; j < n; ++j) s += A[i][j] * x[j];
+                    f = s <= hi[i] && s >= lo[i];
+                }
+                if (!f) continue;
+                long s = 0;
+                for (int j = 0; j < n; ++j) s += c[j] * x[j];
+                best = std::min(best, s);
+            }
+            MilpOptions mo;
+            mo.mip_gap = 0; mo.abs_gap = 1e-9;
+            MilpSolution s = solve_milp(p, mo);
+            if (best == (1L << 40)) {
+                ++infeasible_count;
+                ok = ok && s.status == MilpStatus::Infeasible;
+            } else {
+                ++feasible_count;
+                ok = ok && s.status == MilpStatus::Optimal && std::abs(s.objective - best) < 1e-6;
+            }
+        }
+        tlog(cat, "60 random integer programs == enumeration", ok, 0, 0,
+            (std::to_string(feasible_count) + " feasible, " + std::to_string(infeasible_count) + " infeasible").c_str());
+    }
+    // mixed problems: enumerate the integer part, solve the LP for the continuous part
+    {
+        std::mt19937 g(93);
+        std::uniform_int_distribution<int> cost(-5, 5), rhs(3, 12);
+        std::uniform_real_distribution<double> coef(-2, 3);
+        bool ok = true;
+        double worst = 0;
+        int solved = 0;
+        for (int trial = 0; trial < 30; ++trial) {
+            const int ni = 3, nc = 3, n = ni + nc, m = 4;
+            LpBuilder b(m, n);
+            for (int i = 0; i < m; ++i) {
+                for (int j = 0; j < n; ++j) if (g() % 3) b.a(i, j, std::round(coef(g) * 4) / 4);
+                b.p.row_ub[i] = rhs(g);
+            }
+            for (int j = 0; j < n; ++j) { b.p.c[j] = cost(g); b.p.col_ub[j] = j < ni ? 3 : 5; }
+            LpProblem p = b.build();
+            ints(p, {0, 1, 2});
+            double best = kInf;
+            for (int code = 0; code < 64; ++code) {
+                LpProblem q = p;
+                q.is_integer.clear();
+                int t = code;
+                for (int j = 0; j < ni; ++j) { q.col_lb[j] = q.col_ub[j] = t % 4; t /= 4; }
+                SolverOptions so;
+                so.method = LpMethod::Simplex;
+                so.presolve = false;
+                so.set_tolerance(1e-10);
+                LpSolution s = solve_lp<Cpu::HostStorage>(q, so);
+                if (s.status == Status::Optimal) best = std::min(best, s.primal_objective);
+            }
+            MilpOptions mo;
+            mo.mip_gap = 0; mo.abs_gap = 1e-9;
+            MilpSolution s = solve_milp(p, mo);
+            if (!std::isfinite(best)) { ok = ok && s.status == MilpStatus::Infeasible; continue; }
+            ++solved;
+            const double e = std::abs(s.objective - best) / (1 + std::abs(best));
+            worst = std::max(worst, e);
+            ok = ok && s.status == MilpStatus::Optimal && e < 1e-6;
+        }
+        tlog(cat, "30 random mixed programs == enumeration + LP", ok, worst, 0,
+            (std::to_string(solved) + " feasible").c_str());
+    }
+    // presolved-free search features switched off give the same answer
+    {
+        LpBuilder b(3, 3);
+        b.a(0, 0, 2).a(0, 1, 3).a(0, 2, 1).a(1, 0, 4).a(1, 1, 1).a(1, 2, 2)
+            .a(2, 0, 3).a(2, 1, 4).a(2, 2, 2);
+        b.p.c = {-5, -4, -3};
+        b.p.row_ub = {5, 11, 8};
+        b.p.col_ub = {kInf, kInf, kInf};
+        LpProblem p = b.build();
+        ints(p, {0, 1, 2});
+        MilpOptions mo;
+        mo.propagate = false;
+        mo.diving = false;
+        MilpSolution s = solve_milp(p, mo);
+        tlog(cat, "same answer without propagation and diving", s.status == MilpStatus::Optimal && near(s.objective, -13), 0, 0);
+    }
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -1347,6 +1555,7 @@ main(int argc, char *argv[])
         test_simplex_warm_start();
         test_simplex_degenerate();
         test_concurrent_auto<Cpu::HostStorage>("SOLVER_AUTO_CPU");
+        test_milp();
 #ifdef PANINI_ENABLE_CUDA
         test_concurrent_auto<Cuda::CudaStorage>("SOLVER_AUTO_CUDA");
 #endif

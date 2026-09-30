@@ -8,10 +8,11 @@
 #include "solver/lp/ipm.h"
 #include "solver/lp/pdlp.h"
 #include "solver/lp/solve_lp.h"
+#include "solver/milp/milp.h"
 #include "solver/model.h"
 #include "solver/presolve/presolve.h"
 #include "solver/scaling.h"
 
-#if (defined(AXOS_ENABLE_CUDA) || defined(__CUDACC__)) && defined(CUSPARSE_WITH)
+#if (defined(PANINI_ENABLE_CUDA) || defined(__CUDACC__)) && defined(CUSPARSE_WITH)
 #include "solver/lp/pdlp_cuda.h"
 #endif

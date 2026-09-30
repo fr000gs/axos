@@ -352,3 +352,30 @@ supportcase10 49 -> 38 s, rmine15 timeout -> 90 s (presolve and slice effects ar
 Net on the CPU: 6 instances got faster and 7 slower; the total over the 16 is lower (about 80 s
 gained against 45 s lost, rmine15 counted as 30 s), but it is close, and the slice is what makes
 qap15 and savsched1 fast. `--pdlp-first` forces it on.
+
+## MILP: branch and bound vs HiGHS 1.15.1 (CPU, 1 thread, 60 s limit, gap 1e-4)
+
+Small MIPLIB-1 models from the HiGHS repository (`benchmarks/solver/fetch_mip.sh`), ours via
+`build/run_milp`, HiGHS via `highspy` (`mip_rel_gap 1e-4`, threads 1). No MIP presolve, no cuts.
+
+```
+model      ours ms    nodes  status      objective          HiGHS ms  nodes  objective
+bell5       14397   287223   optimal     8966406.492           260     180  8966406.492
+dcmulti       494     2512   optimal     188182                898       5  188182
+egout        2716    83388   optimal     568.1007               10       1  568.1007
+flugpl          3      432   optimal     1201500                78      89  1201500
+gams10am      0.1        0   infeasible  -                       0       -  infeasible
+gas11         1.8        0   unbounded   -                       6       -  unbounded
+gesa2       60000   126687   feasible    26036435 (gap 1.2%)   413       1  25779856
+gt2            42     1296   optimal     21166                  32       1  21166
+lseu          187     8504   optimal     1120                  157       7  1120
+p01           0.1        0   optimal     263                     4       1  263
+p0548       60000   515459   feasible    34514 (bound 8392)     51       0  8691
+rgn            99     2718   optimal     82.2                  177       1  82.2
+```
+
+Objectives agree wherever both finish. Ours is slower almost everywhere it needs real work: HiGHS
+closes most of these at the root (presolve, cuts, heuristics) while plain branch and bound needs
+thousands of nodes; p0548 and gesa2 are the clearest cases. Our node rate is fine (bell5: 24k nodes/s),
+so the next gains are presolve and cuts, not LP speed. Ablation (same models, 30 s): bound propagation cuts
+nodes by 10x on flugpl (4767 -> 432) and 7x on gt2 (8024 -> 1177); root diving is roughly neutral on these.

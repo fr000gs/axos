@@ -80,6 +80,16 @@ class DualSimplex {
         const SimplexBasis *warm = nullptr, SimplexBasis *out = nullptr,
         const LpSolution *start = nullptr)
     {
+        prepare(p, opt);
+        return resolve(p.col_lb, p.col_ub, warm, out, start, false);
+    }
+
+    // One-time setup for a problem: scaling, transposes, slack columns. `p` and
+    // `opt` must outlive every resolve() call. Together with resolve() this is the
+    // node-LP interface of branch and bound (no matrix copy per node).
+    void
+    prepare(const LpProblem &p, const SolverOptions &opt)
+    {
         t_start_ = std::chrono::steady_clock::now();
         opt_ = &opt;
         orig_ = &p;
@@ -105,19 +115,32 @@ class DualSimplex {
         lb_.assign(N_, 0.0);
         ub_.assign(N_, 0.0);
         cost0_.assign(N_, 0.0);
-        for (int j = 0; j < n_; ++j) {
-            lb_[j] = q_.col_lb[j];
-            ub_[j] = q_.col_ub[j];
-            cost0_[j] = q_.c[j];
-        }
+        for (int j = 0; j < n_; ++j) cost0_[j] = q_.c[j];
         for (int i = 0; i < m_; ++i) {
             lb_[n_ + i] = q_.row_lb[i];
             ub_[n_ + i] = q_.row_ub[i];
         }
-        cost_ = cost0_;
         slack_idx_.resize(m_);
         for (int i = 0; i < m_; ++i) slack_idx_[i] = i;
         slack_val_.assign(m_, -1.0);
+        prepared_ = true;
+    }
+
+    // Solve with the given column bounds (original scale) instead of the problem's,
+    // from `warm` if given; `out` receives the final basis. light: skip the residual
+    // evaluation on the original problem (x, y and the objective are still set).
+    LpSolution
+    resolve(const std::vector<double> &col_lb, const std::vector<double> &col_ub,
+        const SimplexBasis *warm = nullptr, SimplexBasis *out = nullptr,
+        const LpSolution *start = nullptr, bool light = true)
+    {
+        if (!prepared_) throw std::logic_error("DualSimplex::resolve before prepare");
+        t_start_ = std::chrono::steady_clock::now();
+        for (int j = 0; j < n_; ++j) {
+            lb_[j] = col_lb[j] / sc_.col[j];
+            ub_[j] = col_ub[j] / sc_.col[j];
+        }
+        cost_ = cost0_;
         x_.assign(N_, 0.0);
         d_.assign(N_, 0.0);
         y_.assign(m_, 0.0);
@@ -139,7 +162,7 @@ class DualSimplex {
             crossover_ = true;
         }
         Status st = run(warm);
-        LpSolution sol = extract(st);
+        LpSolution sol = extract(st, light);
         if (out) out->status = status_;
         return sol;
     }
@@ -167,7 +190,7 @@ class DualSimplex {
     std::vector<int> head_, pos_;
     BasisFactor bf_;
     long iters_ = 0;
-    bool perturbed_ = false, dse_bad_ = false, crossover_ = false;
+    bool perturbed_ = false, dse_bad_ = false, crossover_ = false, prepared_ = false;
     long dse_rebuild_iter_ = -1000;
     std::mt19937_64 rng_;
     std::chrono::steady_clock::time_point t_start_;
@@ -1061,7 +1084,7 @@ class DualSimplex {
     }
 
     LpSolution
-    extract(Status st)
+    extract(Status st, bool light = false)
     {
         if (opt_->verbose) { // consistency of the final point in the scaled space
             std::vector<double> ax(m_, 0.0);
@@ -1085,7 +1108,16 @@ class DualSimplex {
         for (int j = 0; j < n_; ++j) xv[j] = x_[j];
         for (int i = 0; i < m_; ++i) yv[i] = y_[i];
         unscale_solution(xv, yv, sc_);
-        LpSolution s = evaluate_solution(*orig_, xv, yv);
+        LpSolution s;
+        if (light) { // node LPs: no O(nnz) residual pass, just the point and its objective
+            s.x = xv;
+            s.y = yv;
+            double obj = orig_->offset;
+            for (int j = 0; j < n_; ++j) obj += orig_->c[j] * xv[j];
+            s.primal_objective = s.dual_objective = obj;
+        } else {
+            s = evaluate_solution(*orig_, xv, yv);
+        }
         s.status = st;
         s.iterations = iters_;
         s.seconds = elapsed();
