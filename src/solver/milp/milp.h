@@ -23,6 +23,7 @@
 
 #include "solver/lp/simplex.h"
 #include "solver/model.h"
+#include "solver/presolve/presolve.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -68,7 +69,10 @@ struct MilpOptions {
     bool propagate = true;
     bool diving = true;
     bool verbose = false;
-    SolverOptions lp;          // options of the node LPs (scaling etc.)
+    bool presolve = true;      // MIP-safe presolve and coefficient tightening
+    bool cuts = true;          // root cutting planes (complemented MIR)
+    int cut_rounds = 20;
+    SolverOptions lp;         // options of the node LPs (scaling etc.)
 };
 
 struct MilpSolution {
@@ -80,6 +84,7 @@ struct MilpSolution {
     long nodes = 0;
     long lp_iterations = 0;
     int incumbents = 0;
+    int cuts = 0;              // cut rows added at the root
     double seconds = 0;
     bool has_solution() const { return !x.empty(); }
 };
@@ -91,9 +96,11 @@ class Milp {
     {
         t0_ = std::chrono::steady_clock::now();
         p_ = &p;
+        base_ = &p;
         o_ = &opt;
         n_ = static_cast<int>(p.cols());
         m_ = static_cast<int>(p.rows());
+        m_base_ = m_;
         res_ = MilpSolution();
         std::string bad = p.validate();
         if (!bad.empty()) throw std::invalid_argument("Milp::solve: " + bad);
@@ -125,6 +132,7 @@ class Milp {
         lp_opt_ = o_->lp;
         lp_opt_.presolve = false;
         lp_opt_.verbose = false;
+        lp_opt_.deterministic = true; // a tree search must be reproducible
         simplex_.prepare(p, lp_opt_);
 
         // ---- root ---------------------------------------------------------
@@ -144,6 +152,18 @@ class Milp {
         }
         root_obj_ = r.primal_objective;
         log_header();
+        if (o_->cuts && !int_idx_.empty()) {
+            r = separate_root(r, lb, ub);
+            if (r.status == Status::Infeasible) return finish(MilpStatus::Infeasible);
+            if (r.status != Status::Optimal) { // a cut round failed numerically: re-solve from scratch
+                r = solve_lp(lb, ub, nullptr, &root_basis_);
+                if (r.status == Status::Infeasible) return finish(MilpStatus::Infeasible);
+                if (r.status != Status::Optimal) return finish(MilpStatus::Error);
+            }
+            root_obj_ = r.primal_objective;
+            if (o_->verbose && res_.cuts > 0)
+                std::printf("[milp] root bound after cuts: %.10g (%d cuts)\n", root_obj_, res_.cuts);
+        }
         auto root_basis_ptr = std::make_shared<std::vector<VarStatus>>(root_basis_.status);
         if (handle_lp_point(r, lb, ub)) { // integral: done
             res_.best_bound = root_obj_;
@@ -218,9 +238,11 @@ class Milp {
     }
 
     // ---- problem data ---------------------------------------------------------
-    const LpProblem *p_ = nullptr;
+    const LpProblem *p_ = nullptr;    // the LP being solved (base problem plus cut rows)
+    const LpProblem *base_ = nullptr; // the model as given: what incumbents are checked against
+    LpProblem pcut_;                  // base problem with cuts appended (p_ points here after cuts)
     const MilpOptions *o_ = nullptr;
-    int n_ = 0, m_ = 0;
+    int n_ = 0, m_ = 0, m_base_ = 0; // m_base_: rows of the model as given (cuts come after)
     std::vector<char> isint_;
     std::vector<int> int_idx_;
     HostMatrix At_;
@@ -316,23 +338,37 @@ class Milp {
     bool
     feasible(const std::vector<double> &x) const
     {
-        const double tol = o_->feas_tol;
-        for (int j = 0; j < n_; ++j) {
-            const double l = p_->col_lb[j], u = p_->col_ub[j];
-            if (x[j] < l - tol * (1 + std::abs(l)) || x[j] > u + tol * (1 + std::abs(u))) return false;
-            if (isint_[j] && std::abs(x[j] - std::round(x[j])) > o_->int_tol) return false;
+        return verify(*base_, x, o_->feas_tol, o_->int_tol); // the UNCUT model: cuts never decide feasibility
+    }
+
+  public:
+    // Is x feasible for p: column bounds, integrality and rows, within tolerances?
+    static bool
+    verify(const LpProblem &p, const std::vector<double> &x, double feas_tol, double int_tol)
+    {
+        const int n = static_cast<int>(p.cols()), m = static_cast<int>(p.rows());
+        if (static_cast<int>(x.size()) != n) return false;
+        for (int j = 0; j < n; ++j) {
+            const double l = p.col_lb[j], u = p.col_ub[j];
+            if (!std::isfinite(x[j])) return false;
+            if (x[j] < l - feas_tol * (1 + std::abs(l)) || x[j] > u + feas_tol * (1 + std::abs(u))) return false;
+            if (j < static_cast<int>(p.is_integer.size()) && p.is_integer[j] &&
+                std::abs(x[j] - std::round(x[j])) > int_tol)
+                return false;
         }
-        const auto *rp = p_->A.row_ptr();
-        const auto *ci = p_->A.col_ind();
-        const double *va = p_->A.values();
-        for (int i = 0; i < m_; ++i) {
+        const auto *rp = p.A.row_ptr();
+        const auto *ci = p.A.col_ind();
+        const double *va = p.A.values();
+        for (int i = 0; i < m; ++i) {
             double act = 0;
             for (int k = rp[i]; k < rp[i + 1]; ++k) act += va[k] * x[ci[k]];
-            const double l = p_->row_lb[i], u = p_->row_ub[i];
-            if (act < l - tol * (1 + std::abs(l)) || act > u + tol * (1 + std::abs(u))) return false;
+            const double l = p.row_lb[i], u = p.row_ub[i];
+            if (act < l - feas_tol * (1 + std::abs(l)) || act > u + feas_tol * (1 + std::abs(u))) return false;
         }
         return true;
     }
+
+  private:
 
     double
     objective_of(const std::vector<double> &x) const
@@ -359,6 +395,249 @@ class Milp {
         ++res_.incumbents;
         if (o_->verbose) log_line("inc", obj);
         return true;
+    }
+
+    // ---- cutting planes ----------------------------------------------------------
+    mutable long dbg_[8] = {};
+    struct Cut {
+        std::vector<int> idx;
+        std::vector<double> val;
+        double rhs = 0;   // sum val x <= rhs
+        double eff = 0;   // violation / norm at the LP point
+    };
+
+    // Complemented MIR cut of  sum a_j x_j <= beta  (row = (j, a_j) pairs) at the LP
+    // point x, over the ROOT bounds (so the cut is globally valid). Every column is
+    // substituted by its nearest bound into a nonnegative variable; continuous columns
+    // with a positive coefficient drop out (a relaxation), integer columns are rounded
+    // (Nemhauser-Wolsey MIR), continuous columns with a negative coefficient get the
+    // 1/(delta (1 - f0)) factor. Several deltas are tried; the most efficacious wins.
+    bool
+    cmir(const std::vector<std::pair<int, double>> &row, double beta, const std::vector<double> &x,
+        Cut &best) const
+    {
+        struct Term { int j; double g, xs, bnd; bool integer, compl_; };
+        std::vector<Term> ts;
+        ts.reserve(row.size());
+        bool any_int = false;
+        for (const auto &e : row) {
+            const int j = e.first;
+            const double a = e.second;
+            const double l = lb0_[j], u = ub0_[j];
+            const bool fl = std::isfinite(l), fu = std::isfinite(u);
+            if (!fl && !fu) { ++dbg_[0]; return false; }
+            const bool use_l = fl && (!fu || x[j] - l <= u - x[j]);
+            Term t;
+            t.j = j;
+            t.integer = isint_[j] != 0;
+            any_int = any_int || t.integer;
+            t.compl_ = !use_l;
+            t.bnd = use_l ? l : u;
+            t.g = use_l ? a : -a;              // coefficient of the nonnegative variable
+            t.xs = use_l ? x[j] - l : u - x[j]; // its value at the LP point
+            beta -= a * t.bnd;
+            if (!t.integer && t.g > 0) continue; // positive continuous term: dropped
+            ts.push_back(t);
+        }
+        if (!any_int) { ++dbg_[1]; return false; }
+        // candidate deltas: |g| of integer columns strictly inside their range
+        std::vector<double> deltas;
+        for (const Term &t : ts) {
+            if (!t.integer || t.xs < 1e-6) continue;
+            const double range = (std::isfinite(lb0_[t.j]) && std::isfinite(ub0_[t.j])) ? ub0_[t.j] - lb0_[t.j] : kInf;
+            if (range - t.xs < 1e-6) continue;
+            const double d = std::abs(t.g);
+            if (d > 1e-9) deltas.push_back(d);
+        }
+        deltas.push_back(1.0);
+        std::sort(deltas.begin(), deltas.end());
+        deltas.erase(std::unique(deltas.begin(), deltas.end(),
+                         [](double a, double b) { return std::abs(a - b) <= 1e-9 * std::max(a, b); }),
+            deltas.end());
+        if (deltas.size() > 10) deltas.resize(10);
+        best.eff = 0;
+        bool found = false;
+        std::vector<double> coef(ts.size());
+        for (double delta : deltas) {
+            const double b = beta / delta;
+            const double fb = std::floor(b + 1e-10);
+            const double f0 = b - fb;
+            if (f0 < 0.05 || f0 > 0.95) { ++dbg_[2]; continue; }
+            ++dbg_[3];
+            const double sc = 1.0 / (delta * (1.0 - f0));
+            double viol = -fb, rhs = fb;
+            for (size_t k = 0; k < ts.size(); ++k) {
+                const Term &t = ts[k];
+                double F;
+                if (t.integer) {
+                    const double gd = t.g / delta;
+                    const double fl = std::floor(gd + 1e-10);
+                    F = fl + std::max(0.0, gd - fl - f0) / (1.0 - f0);
+                } else {
+                    F = t.g * sc; // negative
+                }
+                coef[k] = t.compl_ ? -F : F;
+                rhs += t.compl_ ? -F * t.bnd : F * t.bnd;
+                viol += F * t.xs;
+            }
+            double nrm = 0, cmax = 0, cmin = kInf;
+            for (size_t k = 0; k < ts.size(); ++k) {
+                const double c = std::abs(coef[k]);
+                nrm += c * c;
+                if (c > 1e-12) { cmax = std::max(cmax, c); cmin = std::min(cmin, c); }
+            }
+            if (nrm <= 0 || cmax / cmin > 1e7) { ++dbg_[4]; continue; }
+            nrm = std::sqrt(nrm);
+            const double eff = viol / nrm;
+            if (viol < 1e-6 * std::max(1.0, std::abs(rhs)) || eff <= best.eff) { ++dbg_[5]; continue; }
+            // accept: drop negligible coefficients by relaxing the right-hand side
+            Cut c;
+            c.rhs = rhs;
+            bool ok = true;
+            for (size_t k = 0; k < ts.size(); ++k) {
+                const int j = ts[k].j;
+                if (std::abs(coef[k]) > 1e-9 * cmax) {
+                    c.idx.push_back(j);
+                    c.val.push_back(coef[k]);
+                } else if (coef[k] != 0.0) {
+                    const double m = coef[k] > 0 ? coef[k] * lb0_[j] : coef[k] * ub0_[j];
+                    if (!std::isfinite(m)) { ok = false; break; }
+                    c.rhs -= m;
+                }
+            }
+            if (!ok || c.idx.empty()) continue;
+            c.eff = eff;
+            best = std::move(c);
+            found = true;
+        }
+        return found;
+    }
+
+    // MIR cuts from every row that touches an integer column, both directions.
+    void
+    generate_cuts(const std::vector<double> &x, std::vector<Cut> &out) const
+    {
+        const auto *rp = p_->A.row_ptr();
+        const auto *ci = p_->A.col_ind();
+        const double *va = p_->A.values();
+        std::vector<std::pair<int, double>> row;
+        long d_rows = 0, d_int = 0, d_bind = 0, d_try = 0;
+        for (int i = 0; i < m_base_; ++i) { // the original rows only, not earlier cuts
+            const int len = rp[i + 1] - rp[i];
+            if (len < 2 || len > 2000) continue;
+            double act = 0;
+            bool has_int = false;
+            for (int k = rp[i]; k < rp[i + 1]; ++k) { act += va[k] * x[ci[k]]; has_int = has_int || isint_[ci[k]]; }
+            ++d_rows;
+            if (!has_int) continue;
+            ++d_int;
+            for (int dir = 0; dir < 2; ++dir) {
+                const double bound = dir == 0 ? p_->row_ub[i] : p_->row_lb[i];
+                if (!std::isfinite(bound)) continue;
+                const double slack = dir == 0 ? bound - act : act - bound;
+                if (slack > 1e-4 * (1 + std::abs(bound))) continue; // not binding
+                ++d_bind;
+                row.clear();
+                for (int k = rp[i]; k < rp[i + 1]; ++k)
+                    row.emplace_back(ci[k], dir == 0 ? va[k] : -va[k]);
+                Cut c;
+                ++d_try;
+                if (cmir(row, dir == 0 ? bound : -bound, x, c)) out.push_back(std::move(c));
+            }
+        }
+        if (o_->verbose) std::printf("[milp] dbg: free-col %ld no-int %ld f0-out %ld f0-ok %ld numerics %ld not-violated %ld\n", dbg_[0], dbg_[1], dbg_[2], dbg_[3], dbg_[4], dbg_[5]);
+        if (o_->verbose) std::printf("[milp] cut gen: rows %ld with int %ld binding dirs %ld -> %zu cuts\n", d_rows, d_int, d_bind, out.size());
+    }
+
+    // Append cut rows to the LP (p_ switches to pcut_) and re-prepare the simplex.
+    void
+    add_cuts(const std::vector<Cut> &cuts)
+    {
+        LpProblem t = *p_;
+        const auto *rp = p_->A.row_ptr();
+        const auto *ci = p_->A.col_ind();
+        const double *va = p_->A.values();
+        std::vector<int32_t> nrp(rp, rp + m_ + 1), nci(ci, ci + p_->A.nnz());
+        std::vector<double> nva(va, va + p_->A.nnz());
+        for (const Cut &c : cuts) {
+            std::vector<size_t> ord(c.idx.size());
+            for (size_t k = 0; k < ord.size(); ++k) ord[k] = k;
+            std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return c.idx[a] < c.idx[b]; });
+            for (size_t k : ord) { nci.push_back(c.idx[k]); nva.push_back(c.val[k]); }
+            nrp.push_back(static_cast<int32_t>(nci.size()));
+            t.row_lb.push_back(-kInf);
+            t.row_ub.push_back(c.rhs);
+        }
+        t.A = HostMatrix(static_cast<size_t>(m_) + cuts.size(), static_cast<size_t>(n_), nrp, nci, nva);
+        pcut_ = std::move(t);
+        p_ = &pcut_;
+        m_ += static_cast<int>(cuts.size());
+        At_ = pcut_.A.transpose();
+        simplex_.prepare(pcut_, lp_opt_);
+    }
+
+    // Cutting-plane rounds at the root. Returns the last LP solution; `status` of the
+    // returned solution is Optimal, Infeasible (the cuts proved it), or something
+    // else when the LP failed (the caller then re-solves from scratch).
+    LpSolution
+    separate_root(LpSolution r, const std::vector<double> &lb, const std::vector<double> &ub)
+    {
+        double last = r.primal_objective;
+        int stall = 0;
+        size_t total = 0;
+        const size_t cap = std::max<size_t>(300, 2 * static_cast<size_t>(m_base_));
+        const double t_end = std::min(o_->time_limit, elapsed() + 0.25 * std::min(o_->time_limit, 600.0));
+        for (int round = 0; round < o_->cut_rounds && elapsed() < t_end; ++round) {
+            std::vector<int> fr;
+            if (fractional(r.x, fr) == 0) break;
+            std::vector<Cut> cand, pick;
+            generate_cuts(r.x, cand);
+            if (cand.empty()) break;
+            std::sort(cand.begin(), cand.end(), [](const Cut &a, const Cut &b) { return a.eff > b.eff; });
+            const size_t per_round = std::max<size_t>(20, std::min<size_t>(200, static_cast<size_t>(m_base_) / 4 + 10));
+            for (const Cut &c : cand) {
+                if (pick.size() >= per_round) break;
+                // parallelism filter: skip a cut nearly parallel to one already chosen
+                bool par = false;
+                for (const Cut &q : pick) {
+                    double dot = 0, n1 = 0, n2 = 0;
+                    size_t a = 0, b = 0;
+                    for (double v : c.val) n1 += v * v;
+                    for (double v : q.val) n2 += v * v;
+                    while (a < c.idx.size() && b < q.idx.size()) {
+                        if (c.idx[a] == q.idx[b]) dot += c.val[a++] * q.val[b++];
+                        else if (c.idx[a] < q.idx[b]) ++a; else ++b;
+                    }
+                    if (dot > 0.95 * std::sqrt(n1 * n2)) { par = true; break; }
+                }
+                if (!par) pick.push_back(c);
+            }
+            if (pick.empty()) break;
+            // previous basis plus a basic slack for every new row: dual feasible
+            SimplexBasis warm = root_basis_;
+            for (size_t k = 0; k < pick.size(); ++k) warm.status.push_back(VarStatus::Basic);
+            add_cuts(pick);
+            total += pick.size();
+            SimplexBasis nb;
+            LpSolution nr = solve_lp(lb, ub, &warm, &nb);
+            if (nr.status == Status::Infeasible) return nr;
+            if (nr.status != Status::Optimal) {
+                nr = solve_lp(lb, ub, nullptr, &nb); // retry cold
+                if (nr.status != Status::Optimal) return nr;
+            }
+            r = std::move(nr);
+            root_basis_ = std::move(nb);
+            res_.cuts = static_cast<int>(total);
+            const double obj = r.primal_objective;
+            if (o_->verbose)
+                std::printf("[milp] cut round %2d: +%zu cuts (%zu total), bound %.10g\n", round + 1,
+                    pick.size(), total, obj);
+            if (obj - last < 1e-5 * (1 + std::abs(obj))) { if (++stall >= 3) break; }
+            else stall = 0;
+            last = obj;
+            if (total > cap) break;
+        }
+        return r;
     }
 
     // ---- propagation -----------------------------------------------------------
@@ -535,7 +814,15 @@ class Milp {
             return nd;
         };
         pending_.clear();
-        if (fracp >= 0.5) { pending_.push_back(make(true)); pending_.push_back(make(false)); }
+        // Child order: toward the smaller predicted objective increase when the column has
+        // a pseudocost history on both sides, else toward the nearest integer.
+        bool prefer_up = fracp >= 0.5;
+        if (pc_nup_[best] > 0 && pc_ndn_[best] > 0) {
+            const double up_cost = pc_up_[best] / pc_nup_[best] * (1 - fracp);
+            const double dn_cost = pc_dn_[best] / pc_ndn_[best] * fracp;
+            prefer_up = up_cost < dn_cost;
+        }
+        if (prefer_up) { pending_.push_back(make(true)); pending_.push_back(make(false)); }
         else { pending_.push_back(make(false)); pending_.push_back(make(true)); }
     }
 
@@ -666,12 +953,66 @@ class Milp {
     }
 };
 
-// Convenience wrapper.
+// Branch and bound without presolve.
 inline MilpSolution
-solve_milp(const LpProblem &p, const MilpOptions &opt = MilpOptions())
+solve_milp_raw(const LpProblem &p, const MilpOptions &opt)
 {
     Milp m;
     return m.solve(p, opt);
+}
+
+// MIP presolve (integrality-respecting reductions and coefficient tightening),
+// branch and bound on the reduced problem, postsolve, and a feasibility check of
+// the result on the ORIGINAL model; if that check fails the problem is solved again
+// without presolve.
+inline MilpSolution
+solve_milp(const LpProblem &p, const MilpOptions &opt = MilpOptions())
+{
+    if (!opt.presolve) return solve_milp_raw(p, opt);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto secs = [&] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    };
+    PresolveOptions po;
+    po.respect_integrality = true;
+    po.coef_tightening = true;
+    Presolve pre(p, po);
+    MilpSolution s;
+    if (pre.status() == Status::Infeasible || pre.status() == Status::Unbounded) {
+        s.status = pre.status() == Status::Infeasible ? MilpStatus::Infeasible : MilpStatus::Unbounded;
+        s.seconds = secs();
+        return s;
+    }
+    const LpProblem &r = pre.reduced();
+    if (opt.verbose)
+        std::printf("[milp] presolve: %zux%zu -> %zux%zu, %ld coefficients tightened\n", p.rows(),
+            p.cols(), r.rows(), r.cols(), pre.coefficients_tightened());
+    LpSolution rs;
+    rs.status = Status::Optimal;
+    if (r.rows() > 0 && r.cols() > 0) {
+        MilpOptions ro = opt;
+        ro.time_limit = std::max(0.0, opt.time_limit - secs());
+        s = solve_milp_raw(r, ro);
+        if (!s.has_solution()) { s.seconds = secs(); return s; }
+        rs.x = s.x;
+    }
+    LpSolution e = pre.postsolve(rs);
+    if (Milp::verify(p, e.x, opt.feas_tol, opt.int_tol)) {
+        s.x = e.x;
+        double obj = p.offset;
+        for (size_t j = 0; j < p.cols(); ++j) obj += p.c[j] * e.x[j];
+        s.objective = obj;
+        if (r.rows() == 0 || r.cols() == 0) { s.status = MilpStatus::Optimal; s.best_bound = obj; s.gap = 0; }
+        s.seconds = secs();
+        return s;
+    }
+    // the mapped-back point fails on the original model: do not trust the presolve
+    if (opt.verbose) std::printf("[milp] postsolved point infeasible on the original model: solving without presolve\n");
+    MilpOptions fb = opt;
+    fb.time_limit = std::max(0.0, opt.time_limit - secs());
+    MilpSolution f = solve_milp_raw(p, fb);
+    f.seconds = secs();
+    return f;
 }
 
 } // namespace Solver

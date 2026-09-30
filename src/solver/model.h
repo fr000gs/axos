@@ -184,6 +184,7 @@ struct SolverOptions {
     double time_limit = 1e100; // seconds
     bool verbose = false;
     bool pdlp_polish = false;  // Pdlp: reach tight tolerances by polishing a 1e-4 solution (primal / dual feasibility solves)
+    bool deterministic = false; // Simplex: fixed refactorization cadence instead of a timing-based one (reproducible pivoting; used by branch and bound)
     bool pdlp_halpern = true;  // Pdlp: reflected Halpern PDHG with fixed steps instead of adaptive-step PDHG with averaging
     int ipm_normal = 0;       // Ipm (CPU): 0 choose between normal equations and the augmented system, 1 force normal, -1 never
     double ipm_max_flops = 0; // Ipm (CPU): give up (NotSolved) if one factorization exceeds this many flops; 0 = no limit

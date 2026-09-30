@@ -1261,11 +1261,24 @@ MilpSolution s = solve_milp(p, opt);
 // s.x, s.objective (minimization sense, as in LpProblem), s.best_bound, s.gap,
 // s.nodes, s.lp_iterations, s.incumbents
 
+solve_milp first runs a MIP-safe presolve (opt.presolve, on by default): the LP
+presolve rules that keep the integer-feasible set (empty / redundant / forcing rows,
+fixed and empty columns, dual fixing, singleton rows with the bound rounded inward,
+duplicate rows, and substitution or merging of CONTINUOUS columns only), plus
+coefficient tightening of big-M rows (an integer column with range one whose row is
+redundant at one of its values: the coefficient and right-hand side shrink together).
+The reduced problem is solved, mapped back, and the result is checked on the ORIGINAL
+model; if that check ever fails the problem is solved again without presolve.
+solve_milp_raw() skips the presolve. The node LPs use a fixed refactorization cadence
+(SolverOptions::deterministic), so a run is reproducible: same model, same node count.
+
 Branch and bound on the CPU dual simplex: DualSimplex::prepare() is called once
 and every node calls resolve() with its column bounds, warm-started from the
 parent's final basis (the root basis if basis storage would be too large).
-Search is best-first with plunging into the preferred child; branching uses
-pseudocosts (most fractional until costs are known); activity-based bound
+Search is best-first with plunging into the preferred child (the one with the smaller
+predicted objective increase from the pseudocosts, else the nearer integer; this choice
+matters a lot: always-up fixes gt2 but breaks bell5, always-nearest does the reverse);
+branching uses pseudocosts (most fractional until costs are known); activity-based bound
 propagation runs at every node; nodes are cut off by the incumbent (by a whole
 unit when the objective is integral) and by reduced-cost fixing; the root tries
 rounding and a fractional dive, repeated from other nodes while there is no
@@ -1273,15 +1286,15 @@ incumbent. Every incumbent is checked against the ORIGINAL rows, column bounds a
 integrality before it is accepted. opt.propagate / opt.diving switch those two
 features off. opt.lp holds the node-LP options (scaling etc.).
 
-Not implemented yet: MIP presolve (the LP presolve has reductions that are invalid
-for integer columns, so none is applied), cuts, restarts, parallel search, GPU
-support. The LP relaxation at the root is solved by the dual simplex only.
+Not implemented yet: cuts, restarts, parallel search, GPU support, strong /
+reliability branching, stronger MIP presolve (probing, implied integers, clique
+detection). The LP relaxation at the root is solved by the dual simplex only.
 
-On 12 small MIPLIB-1 models from the HiGHS repository: all 8 that finish agree
+On 12 small MIPLIB-1 models from the HiGHS repository: 10 solve to proven optimality
 with HiGHS' objective (and gams10am / gas11 are classified infeasible / unbounded);
-gesa2 ends at a 1.2% gap and p0548 at an incumbent 4x the optimum after 60 s.
-Times are well behind HiGHS on anything needing presolve or cuts (egout 2.7 s
-and 83k nodes against 10 ms and 1 node). See benchmarks/solver/RESULTS.md.
+gesa2 ends at a small gap after 60 s. Times are still behind HiGHS wherever cuts
+matter (bell5 10 s / 259k nodes against 0.26 s / 180 nodes; egout is 124 ms against
+10 ms). See benchmarks/solver/RESULTS.md.
 Tests: SOLVER_MILP in make test_solver_cpu (enumeration references).
 Benchmark: make build/run_milp, then build/run_milp build/mip/*.mps.
 

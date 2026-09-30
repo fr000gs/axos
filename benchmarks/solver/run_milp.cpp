@@ -28,6 +28,8 @@ main(int argc, char **argv)
         else if (a == "--nodes" && i + 1 < argc) o.node_limit = atol(argv[++i]);
         else if (a == "--no-prop") o.propagate = false;
         else if (a == "--no-dive") o.diving = false;
+        else if (a == "--no-presolve") o.presolve = false;
+        else if (a == "--no-cuts") o.cuts = false;
         else if (a == "-v") o.verbose = true;
         else files.push_back(a);
     }

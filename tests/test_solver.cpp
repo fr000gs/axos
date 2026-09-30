@@ -1514,6 +1514,61 @@ test_milp()
         tlog(cat, "30 random mixed programs == enumeration + LP", ok, worst, 0,
             (std::to_string(solved) + " feasible").c_str());
     }
+    // MIP presolve: coefficient tightening of a big-M row, and integrality is kept
+    {
+        // x - 10 y <= 0 with x in [0,5] continuous and y binary: y's coefficient tightens to -5
+        LpBuilder b(2, 3);
+        b.a(0, 0, 1).a(0, 1, -10).a(1, 1, 1).a(1, 2, 1);
+        b.p.c = {-1, 3, 0.5};
+        b.p.col_ub = {5, 1, 4};
+        b.p.row_ub = {0, 10};
+        LpProblem p = b.build();
+        ints(p, {1, 2});
+        PresolveOptions po;
+        po.respect_integrality = true;
+        po.coef_tightening = true;
+        Presolve pre(p, po);
+        bool kept = pre.reduced().is_integer.size() == pre.reduced().cols();
+        bool tightened = pre.coefficients_tightened() >= 1;
+        // the row x - a y <= 0: find |a| in the reduced matrix, must be 5
+        double coef = 0;
+        const LpProblem &r = pre.reduced();
+        for (size_t i = 0; i < r.rows(); ++i)
+            for (int k = r.A.row_ptr()[i]; k < r.A.row_ptr()[i + 1]; ++k)
+                if (r.A.values()[k] < 0) coef = r.A.values()[k];
+        MilpSolution s = solve_milp(p);
+        MilpOptions raw;
+        raw.presolve = false;
+        MilpSolution s0 = solve_milp(p, raw);
+        tlog(cat, "coefficient tightening: big-M row shrinks, answer unchanged",
+            kept && tightened && near(coef, -5) && s.status == MilpStatus::Optimal &&
+                s0.status == MilpStatus::Optimal && near(s.objective, s0.objective),
+            std::abs(s.objective - s0.objective), 0);
+    }
+    // the search is reproducible: the same problem gives the same node count
+    {
+        std::mt19937 g(94);
+        std::uniform_int_distribution<int> w(1, 20), v(1, 30);
+        const int n = 14, m = 3;
+        LpBuilder b(m, n);
+        for (int i = 0; i < m; ++i) {
+            int tot = 0;
+            for (int j = 0; j < n; ++j) { const int a = w(g); tot += a; b.a(i, j, a); }
+            b.p.row_ub[i] = tot / 3;
+        }
+        for (int j = 0; j < n; ++j) { b.p.c[j] = -v(g); b.p.col_ub[j] = 1; }
+        LpProblem p = b.build();
+        p.is_integer.assign(n, 1);
+        long first = -1;
+        bool same = true;
+        for (int rep = 0; rep < 4; ++rep) {
+            MilpSolution s = solve_milp(p);
+            if (first < 0) first = s.nodes;
+            same = same && s.nodes == first;
+        }
+        tlog(cat, "branch and bound is reproducible (same node count)", same, 0, 0,
+            (std::to_string(first) + " nodes").c_str());
+    }
     // presolved-free search features switched off give the same answer
     {
         LpBuilder b(3, 3);

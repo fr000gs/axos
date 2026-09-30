@@ -379,3 +379,30 @@ closes most of these at the root (presolve, cuts, heuristics) while plain branch
 thousands of nodes; p0548 and gesa2 are the clearest cases. Our node rate is fine (bell5: 24k nodes/s),
 so the next gains are presolve and cuts, not LP speed. Ablation (same models, 30 s): bound propagation cuts
 nodes by 10x on flugpl (4767 -> 432) and 7x on gt2 (8024 -> 1177); root diving is roughly neutral on these.
+
+## MILP with MIP presolve (same 12 models, 60 s, deterministic node LPs)
+
+```
+model      no presolve (ms, nodes)        MIP presolve (ms, nodes)      HiGHS (ms, nodes)
+bell5        10223  258677  optimal         10792  258669  optimal          260   180
+dcmulti        551    3121  optimal           404    2346  optimal          898     5
+egout         2777   83476  optimal           124    5392  optimal           10     1
+flugpl           4     499  optimal             3     446  optimal           78    89
+gams10am         0       0  infeasible          0       0  infeasible         0     -
+gas11            2       0  unbounded           0       0  unbounded          6     -
+gesa2        60000  128297  feasible        60056  128267  feasible         413     1
+gt2             55    1800  optimal            56    1686  optimal           32     1
+lseu           229    9950  optimal            95    4212  optimal          157     7
+p01              0       0  optimal             0       0  optimal            4     1
+p0548        60000  634957  feasible        10254  106189  optimal           51     0
+rgn            104    3010  optimal           105    3010  optimal          177     1
+```
+
+10 of 12 solve to optimality (9 without presolve). The presolve's clearest wins are p0548
+(unsolved -> 10 s), egout (22x) and lseu (2.4x). Two things that were NOT presolve effects and cost
+time to find: the first version regressed gt2 from 40 ms to a timeout, which turned out to be (1) the
+search depending on child order (always-up solves gt2 in 3-5k nodes but breaks bell5; always-nearest
+is the reverse; the final rule follows pseudocosts) and (2) run-to-run non-determinism from the
+timing-based LP refactorization (identical problem: 1.9k to 350k nodes), fixed by a fixed refactor
+cadence for node LPs. Repeated runs now give identical node counts.
+Still behind HiGHS wherever cuts decide the search (bell5: 259k nodes against 180; gesa2).

@@ -356,13 +356,24 @@ small programs (pure integer, mixed, infeasible) and against HiGHS on 8 of 12
 MIPLIB-1 models from the HiGHS repository. Weak where presolve and cuts decide:
 p0548 (incumbent 4x optimum, bound 8392 of 8691 after 60 s), gesa2 (1.2% gap), egout
 (83k nodes vs 1). Node throughput is not the problem (bell5: 24k nodes/s).
-Next, in this order of expected payoff: (1) MIP-safe presolve (singleton rows, activity
-bounds, coefficient tightening of big-M rows, implied integers; NOT dual fixing /
-aggregation / column merging of integer columns), (2) root cuts (knapsack cover, MIR,
-Gomory from the tableau) with `Csr::append_rows`, (3) more heuristics (feasibility
-pump, RINS) and restarts, (4) reliability branching, (5) an LP presolve-free but
-Auto-solved root for large instances (needs crossover to get a basis), (6) parallel
-tree search.
+**MIP presolve: done.** `solve_milp` runs the LP presolve with `respect_integrality` (only
+continuous columns are substituted or merged; bounds of integer columns are rounded
+inward; dual recovery is not valid, only x) plus coefficient tightening of big-M rows,
+maps the solution back and re-checks it on the original model (falling back to a
+presolve-free solve if that ever fails). Effect on the 12 HiGHS-repository models:
+p0548 unsolved -> optimal in 10 s, egout 2.8 s -> 124 ms (83k -> 5k nodes), lseu 2.4x,
+dcmulti 1.4x; bell5 and gesa2 unchanged. Two lessons from this step: (a) child order
+matters enormously (always-up fixes gt2 and breaks bell5, always-nearest the reverse;
+the pseudocost-directed order, nearer integer until costs exist, is the compromise);
+(b) the timing-based LP refactorization made the tree search non-reproducible (same
+problem: 1.9k to 350k nodes on gt2), so node LPs now use a fixed cadence
+(`SolverOptions::deterministic`).
+Next, in this order of expected payoff: (1) root cuts (knapsack cover, MIR, Gomory from
+the tableau) with `Csr::append_rows` (bell5 and gesa2 are the targets), (2) strong /
+reliability branching (removes the dependence on child order and ties), (3) more
+heuristics (feasibility pump, RINS) and restarts, (4) stronger MIP presolve (probing,
+implied integers, cliques), (5) an Auto-solved root for large instances (needs
+crossover to get a basis), (6) parallel tree search.
 
 ## Stage 3: QP (convex)
 

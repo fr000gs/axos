@@ -52,6 +52,7 @@ struct RefactorPolicy {
     // > 1 refactors later: large hypersparse bases have noisy iteration times that would
     // otherwise trigger early, and their refactorization is expensive (46% of mcf50k)
     double margin = 1.0;
+    int fixed_freq = 0; // > 0: refactor every fixed_freq iterations (reproducible runs)
     int k = 0;
     clock::time_point t0 = clock::now();
 
@@ -66,6 +67,7 @@ struct RefactorPolicy {
         ++k;
         sum += dt;
         smooth = k == 1 ? dt : 0.8 * smooth + 0.2 * dt;
+        if (fixed_freq > 0) return k >= fixed_freq; // deterministic: no wall-clock dependence
         if (k >= max_updates) return true;
         if (k < 15) return false;
         return smooth > margin * (t_factor + sum) / k;
@@ -512,6 +514,7 @@ class DualSimplex {
         const int refactor_max = 2000; // safety cap on eta-file length
         RefactorPolicy policy;
         policy.margin = m_ > 10000 ? 2.0 : 1.0;
+        policy.fixed_freq = opt_->deterministic ? 100 : 0;
         bool policy_refactor = false;
         SVec rho, colq, tau, rhs;
         rho.init(m_); colq.init(m_); tau.init(m_); rhs.init(m_);
@@ -825,6 +828,7 @@ class DualSimplex {
         const int refactor_max = 2000;
         RefactorPolicy policy;
         policy.margin = m_ > 10000 ? 2.0 : 1.0;
+        policy.fixed_freq = opt_->deterministic ? 100 : 0;
         bool policy_refactor = false;
         SVec rho;
         rho.init(m_);

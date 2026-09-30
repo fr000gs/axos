@@ -53,6 +53,13 @@ struct PresolveOptions {
     bool doubleton_equations = true;
     bool aggregate = true;           // implied-free columns substituted out of equations
     bool parallel_cols = true;       // proportional columns with proportional costs merged
+    // MIP mode: columns marked in LpProblem::is_integer are kept integral (bounds
+    // rounded inward; only continuous columns are substituted or merged away). The
+    // reduced problem keeps the marks. Dual recovery in postsolve is NOT valid then
+    // (only x is), and coefficient tightening (which changes the LP but not the
+    // integer-feasible set) may be enabled.
+    bool respect_integrality = false;
+    bool coef_tightening = false;
     double feas_tol = 1e-9;
 };
 
@@ -69,6 +76,7 @@ class Presolve {
     Status status() const { return status_; }
     const LpProblem &reduced() const { return reduced_; }
     size_t removed_rows() const { return orig_.rows() - reduced_.rows(); }
+    long coefficients_tightened() const { return coef_tightened_; }
     size_t removed_cols() const { return orig_.cols() - reduced_.cols(); }
 
     // Build the original-space solution from a reduced-space one. Also works
@@ -218,6 +226,8 @@ class Presolve {
     std::vector<double> rlb_, rub_, clb_, cub_, cost_;
     double offset_ = 0;
     std::vector<char> row_on_, col_on_;
+    std::vector<char> isint_; // respect_integrality: integer columns (else all 0)
+    long coef_tightened_ = 0;
     std::vector<int> rq_, cq_;
     std::vector<char> rin_, cin_;
 
@@ -401,15 +411,19 @@ class Presolve {
             int j = -1;
             double a = 0;
             for_row(i, [&](int id) { j = ents_[id].c; a = ents_[id].v; });
-            const double lo = a > 0 ? rlb_[i] / a : rub_[i] / a;
-            const double hi = a > 0 ? rub_[i] / a : rlb_[i] / a;
+            double lo = a > 0 ? rlb_[i] / a : rub_[i] / a;
+            double hi = a > 0 ? rub_[i] / a : rlb_[i] / a;
+            if (isint_[j]) { // an integer column takes the bound rounded inward
+                if (std::isfinite(lo)) lo = std::ceil(lo - 1e-9 * (1 + std::abs(lo)));
+                if (std::isfinite(hi)) hi = std::floor(hi + 1e-9 * (1 + std::abs(hi)));
+            }
             Op op; op.kind = Op::SingletonRow; op.i = i; op.j = j; op.a = a;
             op.cj = cost_[j];
             op.colj = col_except(j, i);
             if (lo > clb_[j]) { clb_[j] = lo; op.tight_lb = true; }
             if (hi < cub_[j]) { cub_[j] = hi; op.tight_ub = true; }
             if (clb_[j] > cub_[j]) {
-                if (clb_[j] - cub_[j] > tol_scale(cub_[j], opt_.feas_tol)) {
+                if (isint_[j] || clb_[j] - cub_[j] > tol_scale(cub_[j], opt_.feas_tol)) {
                     status_ = Status::Infeasible;
                     return;
                 }
@@ -452,7 +466,10 @@ class Presolve {
         // forcing: the activity bound meets the opposite row bound
         const bool force_up = lo_fin && std::isfinite(rub_[i]) && a.lo >= rub_[i] - tu;
         const bool force_lo = hi_fin && std::isfinite(rlb_[i]) && a.hi <= rlb_[i] + tl;
-        if (!force_up && !force_lo) return;
+        if (!force_up && !force_lo) {
+            if (opt_.coef_tightening) coef_tighten(i);
+            return;
+        }
         Op op;
         op.kind = Op::Forcing;
         op.i = i;
@@ -470,6 +487,60 @@ class Presolve {
         for (auto &f : fix) fix_col(f.first, f.second);
     }
 
+    // Coefficient tightening (Savelsbergh) of a one-sided row  sum a_j x_j <= rhs  (a
+    // >= row is handled negated): for an integer column with range one (x in {l, l+1})
+    // whose row is redundant at one of its two values, the coefficient and the right-hand
+    // side shrink by the same amount d. The integer-feasible set is unchanged, the LP
+    // relaxation gets tighter (big-M rows). Nothing to undo in postsolve: x is the same.
+    void
+    coef_tighten(int i)
+    {
+        const bool le = std::isfinite(rub_[i]) && rlb_[i] == -kInf;
+        const bool ge = std::isfinite(rlb_[i]) && rub_[i] == kInf;
+        if (!le && !ge) return;
+        const double s = le ? 1.0 : -1.0;
+        double rhs = le ? rub_[i] : -rlb_[i];
+        double maxact = 0;
+        bool fin = true;
+        std::vector<int> ids;
+        for_row(i, [&](int id) {
+            const int j = ents_[id].c;
+            const double a = s * ents_[id].v;
+            const double m = a > 0 ? a * cub_[j] : a * clb_[j];
+            if (!std::isfinite(m)) fin = false;
+            maxact += m;
+            ids.push_back(id);
+        });
+        if (!fin || maxact <= rhs) return; // unbounded activity, or redundant (handled elsewhere)
+        for (int id : ids) {
+            if (!alive_[id]) continue;
+            const int j = ents_[id].c;
+            if (!isint_[j]) continue;
+            const double l = clb_[j], u = cub_[j];
+            if (!std::isfinite(l) || !std::isfinite(u) || u - l != 1.0) continue;
+            const double a = s * ents_[id].v;
+            double d = 0, a_new = a, rhs_new = rhs, max_new = maxact;
+            if (a > 0) {           // activity at x = l is maxact - a
+                d = rhs - (maxact - a);
+                if (d > 1e-6 * (1 + std::abs(a)) && d < a) {
+                    a_new = a - d; rhs_new = rhs - d * u; max_new = maxact - d * u;
+                } else d = 0;
+            } else if (a < 0) {    // activity at x = u is maxact + a
+                d = rhs - (maxact + a);
+                if (d > 1e-6 * (1 + std::abs(a)) && d < -a) {
+                    a_new = a + d; rhs_new = rhs + d * l; max_new = maxact + d * l;
+                } else d = 0;
+            }
+            if (d == 0) continue;
+            ents_[id].v = s * a_new;
+            rhs = rhs_new;
+            maxact = max_new;
+            if (le) rub_[i] = rhs; else rlb_[i] = -rhs;
+            ++coef_tightened_;
+            push_col(j);
+        }
+    }
+
     // a x_j + b x_k = rhs: substitute x_k = (rhs - a x_j) / b everywhere
     bool
     doubleton(int i)
@@ -485,6 +556,12 @@ class Presolve {
         const double big = std::max(std::abs(e0.v), std::abs(e1.v));
         if (first_k && std::abs(e0.v) < 1e-2 * big) first_k = false;
         if (!first_k && std::abs(e1.v) < 1e-2 * big) first_k = true;
+        // MIP mode: only a continuous column can be substituted out
+        if (isint_[(first_k ? e0 : e1).c]) {
+            if (isint_[(first_k ? e1 : e0).c]) return false; // both integer
+            first_k = !first_k;
+            if (std::abs((first_k ? e0 : e1).v) < 1e-2 * big) return false;
+        }
         const Ent &ek = first_k ? e0 : e1, &ej = first_k ? e1 : e0;
         const int j = ej.c, k = ek.c;
         const double a = ej.v, b = ek.v, rhs = rlb_[i];
@@ -512,8 +589,12 @@ class Presolve {
         if (hi < cub_[j] && (cub_[j] == kInf || hi < cub_[j] - tol_scale(cub_[j], 1e-12))) {
             cub_[j] = hi; op.tight_ub = true; op.new_ub = hi;
         }
+        if (isint_[j]) { // an integer column keeps integral bounds
+            if (std::isfinite(clb_[j])) clb_[j] = std::ceil(clb_[j] - 1e-9 * (1 + std::abs(clb_[j])));
+            if (std::isfinite(cub_[j])) cub_[j] = std::floor(cub_[j] + 1e-9 * (1 + std::abs(cub_[j])));
+        }
         if (clb_[j] > cub_[j]) {
-            if (clb_[j] - cub_[j] > tol_scale(cub_[j], opt_.feas_tol)) {
+            if (isint_[j] || clb_[j] - cub_[j] > tol_scale(cub_[j], opt_.feas_tol)) {
                 status_ = Status::Infeasible;
                 return true;
             }
@@ -587,6 +668,7 @@ class Presolve {
     bool
     aggregate(int j)
     {
+        if (isint_[j]) return false; // only a continuous column can be substituted out
         constexpr int kMaxFill = 64;
         int best_i = -1, best_len = 1 << 30;
         double best_a = 0;
@@ -645,6 +727,7 @@ class Presolve {
     void
     singleton_col(int j)
     {
+        if (isint_[j]) return;
         int i = -1;
         double a = 0;
         for_col(j, [&](int id) { i = ents_[id].r; a = ents_[id].v; });
@@ -755,7 +838,7 @@ class Presolve {
             std::sort(out.begin(), out.end());
         };
         for (size_t j = 0; j < n; ++j) {
-            if (!col_on_[j] || ccnt_[j] < 1) continue;
+            if (!col_on_[j] || ccnt_[j] < 1 || isint_[j]) continue; // integer columns are never merged
             normalized(static_cast<int>(j), cj);
             const double fv = cj[0].second;
             size_t h = 1469598103934665603ULL;
@@ -819,6 +902,15 @@ class Presolve {
         clb_ = orig_.col_lb; cub_ = orig_.col_ub;
         cost_ = orig_.c;
         offset_ = orig_.offset;
+        isint_.assign(n, 0);
+        if (opt_.respect_integrality)
+            for (size_t j = 0; j < n && j < orig_.is_integer.size(); ++j) {
+                if (!orig_.is_integer[j]) continue;
+                isint_[j] = 1;
+                if (std::isfinite(clb_[j])) clb_[j] = std::ceil(clb_[j] - 1e-9 * (1 + std::abs(clb_[j])));
+                if (std::isfinite(cub_[j])) cub_[j] = std::floor(cub_[j] + 1e-9 * (1 + std::abs(cub_[j])));
+                if (clb_[j] > cub_[j]) { status_ = Status::Infeasible; return; }
+            }
         row_on_.assign(m, 1);
         col_on_.assign(n, 1);
         rcnt_.assign(m, 0);
@@ -894,6 +986,10 @@ class Presolve {
         }
         reduced_.offset = offset_;
         reduced_.maximize = orig_.maximize;
+        if (opt_.respect_integrality) {
+            reduced_.is_integer.assign(col_map_.size(), 0);
+            for (size_t k = 0; k < col_map_.size(); ++k) reduced_.is_integer[k] = isint_[col_map_[k]];
+        }
     }
 };
 
