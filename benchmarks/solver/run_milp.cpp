@@ -30,6 +30,7 @@ main(int argc, char **argv)
         else if (a == "--no-dive") o.diving = false;
         else if (a == "--no-presolve") o.presolve = false;
         else if (a == "--no-cuts") o.cuts = false;
+        else if (a == "--no-gomory") o.gomory = false;
         else if (a == "-v") o.verbose = true;
         else files.push_back(a);
     }

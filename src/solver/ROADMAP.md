@@ -368,12 +368,25 @@ the pseudocost-directed order, nearer integer until costs exist, is the compromi
 (b) the timing-based LP refactorization made the tree search non-reproducible (same
 problem: 1.9k to 350k nodes on gt2), so node LPs now use a fixed cadence
 (`SolverOptions::deterministic`).
-Next, in this order of expected payoff: (1) root cuts (knapsack cover, MIR, Gomory from
-the tableau) with `Csr::append_rows` (bell5 and gesa2 are the targets), (2) strong /
-reliability branching (removes the dependence on child order and ties), (3) more
-heuristics (feasibility pump, RINS) and restarts, (4) stronger MIP presolve (probing,
-implied integers, cliques), (5) an Auto-solved root for large instances (needs
-crossover to get a basis), (6) parallel tree search.
+**Root cuts: done** (complemented MIR from single rows, and Gomory mixed-integer cuts
+from the simplex tableau via `DualSimplex::begin_tableau()/tableau_row()`; rounds until
+the bound stalls; cuts are global, live in the LP only, and the non-binding ones are
+purged after the last round; incumbents are verified on the uncut model). Validated
+against exhaustive enumeration on 80 random wide-range integer programs (134 cuts kept)
+plus the earlier 115. Effect on the 12 HiGHS-repository models (vs presolve only):
+p0548 10.7 s -> 0.15 s (106k -> 370 nodes), bell5 10.3 s -> 2.7 s (259k -> 62k nodes),
+egout 125 -> 14 ms, dcmulti 290 nodes, lseu 97 -> 74 ms, **gesa2 solved (57 s)**; gt2 and
+rgn unchanged to within 50%. Single-row MIR alone found nothing on bell5 (its rows have
+integer right-hand sides after bound substitution); the Gomory cuts did the work. Two
+lessons: (a) without purging inactive cuts the tree got 30x slower per node on tiny
+models, (b) a cut that is only approximately valid would be caught by checking
+incumbents on the uncut model, which is why that check stays.
+Next, in this order of expected payoff: (1) strong / reliability branching (removes the
+dependence on child order and ties, which still makes gt2-like models erratic), (2) more
+heuristics (feasibility pump, RINS) and restarts, (3) knapsack-cover / flow-cover cuts
+and cuts at tree nodes, (4) stronger MIP presolve (probing, implied integers, cliques),
+(5) an Auto-solved root for large instances (needs crossover to get a basis),
+(6) parallel tree search.
 
 ## Stage 3: QP (convex)
 

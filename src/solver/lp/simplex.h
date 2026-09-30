@@ -171,6 +171,46 @@ class DualSimplex {
 
     long iterations() const { return iters_; }
 
+    // ---- tableau access (for Gomory cuts), valid after a solve ------------------------
+    // One row of the optimal tableau in ORIGINAL scale:  x_B + sum_j coef_j x_j = 0 over
+    // the nonbasic, non-fixed variables of the final basis (numbering: j < n structural,
+    // n + i the slack w_i = (A x)_i of row i, in the formulation A x - w = 0).
+    // state_j: 0 at lower bound, 1 at upper bound, 2 free (value 0).
+    struct TableauRow {
+        std::vector<int> var;
+        std::vector<double> coef;
+        std::vector<signed char> state;
+    };
+    int basis_size() const { return m_; }
+    int basic_var(int pos) const { return head_[pos]; }
+    // original-scale value of variable j at the final point
+    double var_value(int j) const { return x_[j] * scale_of(j); }
+    // Call once after a solve, before tableau_row().
+    void
+    begin_tableau()
+    {
+        rebuild_active(lb_, ub_);
+        if (tab_rho_.size() != m_) tab_rho_.init(m_);
+        if (static_cast<int>(tab_arow_.size()) != N_) { tab_arow_.assign(N_, 0.0); tab_aidx_.clear(); }
+    }
+    bool
+    tableau_row(int pos, TableauRow &out)
+    {
+        if (!prepared_ || pos < 0 || pos >= m_ || tab_rho_.size() != m_) return false;
+        pivot_row(pos, tab_rho_, tab_arow_, tab_aidx_);
+        const double sB = scale_of(head_[pos]);
+        out.var.clear(); out.coef.clear(); out.state.clear();
+        for (int j : tab_aidx_) {
+            if (status_[j] == VarStatus::Basic) continue;
+            const double c = tab_arow_[j] * sB / scale_of(j);
+            if (std::abs(c) < 1e-12) continue;
+            out.var.push_back(j);
+            out.coef.push_back(c);
+            out.state.push_back(status_[j] == VarStatus::AtLower ? 0 : status_[j] == VarStatus::AtUpper ? 1 : 2);
+        }
+        return true;
+    }
+
   private:
     // ---- problem data (scaled) --------------------------------------------
     const LpProblem *orig_ = nullptr;
@@ -185,7 +225,11 @@ class DualSimplex {
     std::vector<double> slack_val_;
     // ---- simplex state ------------------------------------------------------
     std::vector<double> x_, d_, y_, dse_, pinf_;
+    double scale_of(int j) const { return j < n_ ? sc_.col[j] : 1.0 / sc_.row[j - n_]; }
     std::vector<uint8_t> active_;
+    SVec tab_rho_;
+    std::vector<double> tab_arow_;
+    std::vector<int> tab_aidx_;
     std::vector<std::vector<int>> price_buf_;
     std::vector<int> cbuf_;
     std::vector<VarStatus> status_;

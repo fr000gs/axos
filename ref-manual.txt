@@ -1286,15 +1286,28 @@ incumbent. Every incumbent is checked against the ORIGINAL rows, column bounds a
 integrality before it is accepted. opt.propagate / opt.diving switch those two
 features off. opt.lp holds the node-LP options (scaling etc.).
 
-Not implemented yet: cuts, restarts, parallel search, GPU support, strong /
-reliability branching, stronger MIP presolve (probing, implied integers, clique
-detection). The LP relaxation at the root is solved by the dual simplex only.
+Root cutting planes (opt.cuts, opt.gomory, opt.cut_rounds): complemented mixed-integer
+rounding (MIR) cuts from single rows, and Gomory mixed-integer cuts from the optimal
+simplex tableau (DualSimplex::begin_tableau() / tableau_row(), original scale). Each
+round separates at the LP point, keeps the most efficacious cuts (a parallelism filter
+drops near-duplicates), appends them as rows and re-solves from the old basis plus basic
+slacks (dual feasible); rounds stop when the bound stalls. After the last round the cuts
+that are not binding at the root are purged (they only slow every node LP: without the
+purge rgn went from 0.1 s to 2.4 s). The cuts are global and live only in the LP:
+incumbents are always verified against the UNCUT model. MilpSolution::cuts reports how
+many were kept.
 
-On 12 small MIPLIB-1 models from the HiGHS repository: 10 solve to proven optimality
-with HiGHS' objective (and gams10am / gas11 are classified infeasible / unbounded);
-gesa2 ends at a small gap after 60 s. Times are still behind HiGHS wherever cuts
-matter (bell5 10 s / 259k nodes against 0.26 s / 180 nodes; egout is 124 ms against
-10 ms). See benchmarks/solver/RESULTS.md.
+Not implemented yet: restarts, parallel search, GPU support, strong / reliability
+branching, stronger MIP presolve (probing, implied integers, clique detection), cuts
+at tree nodes, knapsack cover / flow cover cuts. The LP relaxation at the root is
+solved by the dual simplex only.
+
+On 12 small MIPLIB-1 models from the HiGHS repository all 10 feasible ones solve to
+proven optimality with HiGHS' objective (gams10am / gas11 are classified infeasible /
+unbounded): p0548 148 ms and 370 nodes, egout 14 ms, bell5 2.7 s, gesa2 57 s. HiGHS is
+still faster on most of them (bell5 0.26 s / 180 nodes, gesa2 0.4 s), because its cuts,
+heuristics and presolve close more of the gap at the root. See
+benchmarks/solver/RESULTS.md.
 Tests: SOLVER_MILP in make test_solver_cpu (enumeration references).
 Benchmark: make build/run_milp, then build/run_milp build/mip/*.mps.
 

@@ -1471,6 +1471,57 @@ test_milp()
         tlog(cat, "60 random integer programs == enumeration", ok, 0, 0,
             (std::to_string(feasible_count) + " feasible, " + std::to_string(infeasible_count) + " infeasible").c_str());
     }
+    // general integers with wider ranges (cuts have more to work with) against exhaustive enumeration
+    {
+        std::mt19937 g(95);
+        std::uniform_int_distribution<int> coef(-5, 9), cost(-9, 9), rhs(6, 40);
+        bool ok = true;
+        int feas = 0, infeas = 0;
+        long cuts_total = 0;
+        for (int trial = 0; trial < 80; ++trial) {
+            const int n = 6, m = 4, R = 6, base = R + 1;
+            LpBuilder b(m, n);
+            std::vector<std::vector<int>> A(m, std::vector<int>(n));
+            std::vector<int> c(n), lo(m), hi(m);
+            for (int i = 0; i < m; ++i) {
+                for (int j = 0; j < n; ++j) { A[i][j] = coef(g); if (A[i][j]) b.a(i, j, A[i][j]); }
+                const int r = rhs(g);
+                if (i == 1 && trial % 4 == 0) { lo[i] = hi[i] = r / 2; }
+                else if (trial % 5 == 1 && i == 2) { lo[i] = r / 3; hi[i] = r; }
+                else { lo[i] = -100000; hi[i] = r; }
+                b.p.row_lb[i] = lo[i] == -100000 ? -kInf : lo[i];
+                b.p.row_ub[i] = hi[i];
+            }
+            for (int j = 0; j < n; ++j) { c[j] = cost(g); b.p.c[j] = c[j]; b.p.col_ub[j] = R; }
+            LpProblem p = b.build();
+            p.is_integer.assign(n, 1);
+            long best = 1L << 40;
+            std::vector<int> x(n);
+            for (int code = 0; code < 117649; ++code) {
+                int t = code;
+                for (int j = 0; j < n; ++j) { x[j] = t % base; t /= base; }
+                bool f = true;
+                for (int i = 0; i < m && f; ++i) {
+                    int s = 0;
+                    for (int j = 0; j < n; ++j) s += A[i][j] * x[j];
+                    f = s <= hi[i] && s >= lo[i];
+                }
+                if (!f) continue;
+                long s = 0;
+                for (int j = 0; j < n; ++j) s += c[j] * x[j];
+                best = std::min(best, s);
+            }
+            MilpOptions mo;
+            mo.mip_gap = 0; mo.abs_gap = 1e-9;
+            MilpSolution s = solve_milp(p, mo);
+            cuts_total += s.cuts;
+            if (best == (1L << 40)) { ++infeas; ok = ok && s.status == MilpStatus::Infeasible; }
+            else { ++feas; ok = ok && s.status == MilpStatus::Optimal && std::abs(s.objective - best) < 1e-6; }
+        }
+        tlog(cat, "80 random wide-range integer programs == enumeration (cuts on)", ok && cuts_total > 0, 0, 0,
+            (std::to_string(feas) + " feasible, " + std::to_string(infeas) + " infeasible, " +
+                std::to_string(cuts_total) + " cuts kept").c_str());
+    }
     // mixed problems: enumerate the integer part, solve the LP for the continuous part
     {
         std::mt19937 g(93);

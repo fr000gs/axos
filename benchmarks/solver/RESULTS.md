@@ -406,3 +406,31 @@ is the reverse; the final rule follows pseudocosts) and (2) run-to-run non-deter
 timing-based LP refactorization (identical problem: 1.9k to 350k nodes), fixed by a fixed refactor
 cadence for node LPs. Repeated runs now give identical node counts.
 Still behind HiGHS wherever cuts decide the search (bell5: 259k nodes against 180; gesa2).
+
+## MILP with root cuts (same 12 models, 60 s, deterministic)
+
+MIP presolve on in every column; cuts = complemented MIR + Gomory mixed-integer cuts from the
+tableau, rounds until the bound stalls, inactive cuts purged, incumbents verified on the uncut model.
+
+```
+model      presolve only              + MIR cuts                 + MIR + Gomory + purge      HiGHS
+           ms      nodes              ms      nodes              ms      nodes   status      ms    nodes
+bell5     10282   258669             10364   258669              2687    61519   optimal     260     180
+dcmulti     404     2346               414     2346               353      290   optimal     898       5
+egout       125     5392                26      954                14      159   optimal      10       1
+flugpl        3      446                 3      446                 6      280   optimal      78      89
+gesa2     61687   116203             61899   114872             56948   111292   optimal     413       1
+gt2          85     1686               165     2728                88     1191   optimal      32       1
+lseu         97     4212               214     4128                74     1040   optimal     157       7
+p0548     10699   106189              2397    14095               148      370   optimal      51       0
+rgn         108     3010               214     2462               150     2464   optimal     177       1
+(gams10am infeasible, gas11 unbounded, p01 trivial: unchanged)
+```
+
+All 10 feasible models are now proven optimal within 60 s with HiGHS' objective (gesa2 at 57 s is
+the closest call). Steps that mattered: single-row MIR alone helps egout and p0548 but finds nothing
+on bell5 or dcmulti; the Gomory cuts (nodes 8x fewer on dcmulti, 34x on egout, 287x on p0548) are what makes
+the difference; the first Gomory version made node LPs 30x slower on small models (rgn 108 ms ->
+2.4 s) because every cut stayed in the LP, and purging the cuts that are not binding at the root
+removed that cost. Still behind HiGHS on the models it solves at the root by presolve and heuristics
+(bell5: 62k nodes against 180; gesa2 and p0548 closer).

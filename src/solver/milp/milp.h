@@ -70,7 +70,8 @@ struct MilpOptions {
     bool diving = true;
     bool verbose = false;
     bool presolve = true;      // MIP-safe presolve and coefficient tightening
-    bool cuts = true;          // root cutting planes (complemented MIR)
+    bool cuts = true;          // root cutting planes
+    bool gomory = true;        // ... including Gomory mixed-integer cuts from the tableau
     int cut_rounds = 20;
     SolverOptions lp;         // options of the node LPs (scaling etc.)
 };
@@ -398,7 +399,6 @@ class Milp {
     }
 
     // ---- cutting planes ----------------------------------------------------------
-    mutable long dbg_[8] = {};
     struct Cut {
         std::vector<int> idx;
         std::vector<double> val;
@@ -425,7 +425,7 @@ class Milp {
             const double a = e.second;
             const double l = lb0_[j], u = ub0_[j];
             const bool fl = std::isfinite(l), fu = std::isfinite(u);
-            if (!fl && !fu) { ++dbg_[0]; return false; }
+            if (!fl && !fu) return false;
             const bool use_l = fl && (!fu || x[j] - l <= u - x[j]);
             Term t;
             t.j = j;
@@ -439,7 +439,7 @@ class Milp {
             if (!t.integer && t.g > 0) continue; // positive continuous term: dropped
             ts.push_back(t);
         }
-        if (!any_int) { ++dbg_[1]; return false; }
+        if (!any_int) return false;
         // candidate deltas: |g| of integer columns strictly inside their range
         std::vector<double> deltas;
         for (const Term &t : ts) {
@@ -462,8 +462,7 @@ class Milp {
             const double b = beta / delta;
             const double fb = std::floor(b + 1e-10);
             const double f0 = b - fb;
-            if (f0 < 0.05 || f0 > 0.95) { ++dbg_[2]; continue; }
-            ++dbg_[3];
+            if (f0 < 0.05 || f0 > 0.95) continue;
             const double sc = 1.0 / (delta * (1.0 - f0));
             double viol = -fb, rhs = fb;
             for (size_t k = 0; k < ts.size(); ++k) {
@@ -486,10 +485,10 @@ class Milp {
                 nrm += c * c;
                 if (c > 1e-12) { cmax = std::max(cmax, c); cmin = std::min(cmin, c); }
             }
-            if (nrm <= 0 || cmax / cmin > 1e7) { ++dbg_[4]; continue; }
+            if (nrm <= 0 || cmax / cmin > 1e7) continue;
             nrm = std::sqrt(nrm);
             const double eff = viol / nrm;
-            if (viol < 1e-6 * std::max(1.0, std::abs(rhs)) || eff <= best.eff) { ++dbg_[5]; continue; }
+            if (viol < 1e-6 * std::max(1.0, std::abs(rhs)) || eff <= best.eff) continue;
             // accept: drop negligible coefficients by relaxing the right-hand side
             Cut c;
             c.rhs = rhs;
@@ -521,32 +520,125 @@ class Milp {
         const auto *ci = p_->A.col_ind();
         const double *va = p_->A.values();
         std::vector<std::pair<int, double>> row;
-        long d_rows = 0, d_int = 0, d_bind = 0, d_try = 0;
         for (int i = 0; i < m_base_; ++i) { // the original rows only, not earlier cuts
             const int len = rp[i + 1] - rp[i];
             if (len < 2 || len > 2000) continue;
             double act = 0;
             bool has_int = false;
             for (int k = rp[i]; k < rp[i + 1]; ++k) { act += va[k] * x[ci[k]]; has_int = has_int || isint_[ci[k]]; }
-            ++d_rows;
             if (!has_int) continue;
-            ++d_int;
             for (int dir = 0; dir < 2; ++dir) {
                 const double bound = dir == 0 ? p_->row_ub[i] : p_->row_lb[i];
                 if (!std::isfinite(bound)) continue;
                 const double slack = dir == 0 ? bound - act : act - bound;
                 if (slack > 1e-4 * (1 + std::abs(bound))) continue; // not binding
-                ++d_bind;
                 row.clear();
                 for (int k = rp[i]; k < rp[i + 1]; ++k)
                     row.emplace_back(ci[k], dir == 0 ? va[k] : -va[k]);
                 Cut c;
-                ++d_try;
                 if (cmir(row, dir == 0 ? bound : -bound, x, c)) out.push_back(std::move(c));
             }
         }
-        if (o_->verbose) std::printf("[milp] dbg: free-col %ld no-int %ld f0-out %ld f0-ok %ld numerics %ld not-violated %ld\n", dbg_[0], dbg_[1], dbg_[2], dbg_[3], dbg_[4], dbg_[5]);
-        if (o_->verbose) std::printf("[milp] cut gen: rows %ld with int %ld binding dirs %ld -> %zu cuts\n", d_rows, d_int, d_bind, out.size());
+    }
+
+    // Gomory mixed-integer cuts from the tableau rows of fractional basic integer columns
+    // (the most fractional ones). With nonbasic variables substituted by nonnegative
+    // t (at lower: x - l, at upper: u - x) a row reads  x_B + sum a_j t_j = b  with
+    // f0 = frac(b); the cut is  sum c_j t_j >= 1  with c_j = f_j/f0 or (1-f_j)/(1-f0)
+    // for integer t_j (f_j = frac(a_j)) and a_j/f0 or -a_j/(1-f0) for continuous ones
+    // (slacks count as continuous). Translated back to x (a slack is its row activity).
+    void
+    generate_gomory(const LpSolution &r, std::vector<Cut> &out)
+    {
+        simplex_.begin_tableau();
+        std::vector<std::pair<double, int>> cand;
+        for (int pos = 0; pos < simplex_.basis_size(); ++pos) {
+            const int j = simplex_.basic_var(pos);
+            if (j >= n_ || !isint_[j]) continue;
+            const double f = r.x[j] - std::floor(r.x[j]);
+            if (f < 0.05 || f > 0.95) continue;
+            cand.emplace_back(std::abs(f - 0.5), pos);
+        }
+        std::sort(cand.begin(), cand.end());
+        const size_t rows_max = std::min<size_t>(cand.size(), 50);
+        const auto *rp = p_->A.row_ptr();
+        const auto *ci = p_->A.col_ind();
+        const double *va = p_->A.values();
+        std::vector<double> acc(n_, 0.0);
+        std::vector<char> seen(n_, 0);
+        std::vector<int> touched;
+        DualSimplex::TableauRow tr;
+        for (size_t k = 0; k < rows_max; ++k) {
+            const int pos = cand[k].second;
+            const int jb = simplex_.basic_var(pos);
+            if (!simplex_.tableau_row(pos, tr)) continue;
+            const double f0 = r.x[jb] - std::floor(r.x[jb]);
+            bool ok = true;
+            double rhs = 1.0; // sum a x >= rhs
+            touched.clear();
+            auto add = [&](int v, double a) {
+                if (!seen[v]) { seen[v] = 1; touched.push_back(v); }
+                acc[v] += a;
+            };
+            for (size_t q = 0; q < tr.var.size() && ok; ++q) {
+                const int v = tr.var[q];
+                if (tr.state[q] == 2) { ok = false; break; } // a free nonbasic variable
+                const bool atu = tr.state[q] == 1;
+                double l, u;
+                bool integer = false;
+                if (v < n_) { l = lb0_[v]; u = ub0_[v]; integer = isint_[v] != 0; }
+                else { l = p_->row_lb[v - n_]; u = p_->row_ub[v - n_]; }
+                const double bound = atu ? u : l;
+                if (!std::isfinite(bound)) { ok = false; break; }
+                const double a = atu ? -tr.coef[q] : tr.coef[q]; // coefficient of t_v >= 0
+                double c;
+                if (integer) {
+                    double fj = a - std::floor(a);
+                    if (fj < 1e-9 || fj > 1 - 1e-9) fj = 0;
+                    c = fj <= f0 ? fj / f0 : (1 - fj) / (1 - f0);
+                } else {
+                    c = a >= 0 ? a / f0 : -a / (1 - f0);
+                }
+                if (c == 0) continue;
+                const double sgn = atu ? -1.0 : 1.0; // t = sgn (x - bound)
+                rhs += c * sgn * bound;
+                if (v < n_) add(v, c * sgn);
+                else {
+                    const int i = v - n_;
+                    for (int e = rp[i]; e < rp[i + 1]; ++e) add(ci[e], c * sgn * va[e]);
+                }
+            }
+            Cut cut;
+            if (ok) {
+                // sum a x >= rhs  ->  sum (-a) x <= -rhs
+                double cmax = 0, cmin = kInf, nrm = 0, lhs = 0;
+                for (int v : touched) {
+                    const double c = std::abs(acc[v]);
+                    if (c > 1e-12) { cmax = std::max(cmax, c); cmin = std::min(cmin, c); }
+                }
+                cut.rhs = -rhs;
+                for (int v : touched) {
+                    const double a = -acc[v];
+                    if (std::abs(a) > 1e-9 * cmax && a != 0.0) {
+                        cut.idx.push_back(v);
+                        cut.val.push_back(a);
+                        nrm += a * a;
+                        lhs += a * r.x[v];
+                    } else if (a != 0.0) { // negligible: relax the right-hand side
+                        const double m = a > 0 ? a * lb0_[v] : a * ub0_[v];
+                        if (!std::isfinite(m)) { ok = false; break; }
+                        cut.rhs -= m;
+                    }
+                }
+                const double viol = lhs - cut.rhs;
+                if (ok && !cut.idx.empty() && cmax > 0 && cmax / cmin < 1e7 && nrm > 0 &&
+                    viol > 1e-6 * std::max(1.0, std::abs(cut.rhs))) {
+                    cut.eff = viol / std::sqrt(nrm);
+                    if (cut.eff > 1e-5) out.push_back(std::move(cut));
+                }
+            }
+            for (int v : touched) { acc[v] = 0; seen[v] = 0; }
+        }
     }
 
     // Append cut rows to the LP (p_ switches to pcut_) and re-prepare the simplex.
@@ -592,6 +684,7 @@ class Milp {
             if (fractional(r.x, fr) == 0) break;
             std::vector<Cut> cand, pick;
             generate_cuts(r.x, cand);
+            if (o_->gomory) generate_gomory(r, cand);
             if (cand.empty()) break;
             std::sort(cand.begin(), cand.end(), [](const Cut &a, const Cut &b) { return a.eff > b.eff; });
             const size_t per_round = std::max<size_t>(20, std::min<size_t>(200, static_cast<size_t>(m_base_) / 4 + 10));
@@ -637,7 +730,51 @@ class Milp {
             last = obj;
             if (total > cap) break;
         }
-        return r;
+        return purge_cuts(lb, ub, std::move(r));
+    }
+
+    // Drop the cut rows that are not binding at the root optimum (their slack is basic):
+    // they only make every node LP bigger. The remaining basis stays valid.
+    LpSolution
+    purge_cuts(const std::vector<double> &lb, const std::vector<double> &ub, LpSolution r)
+    {
+        if (m_ == m_base_ || r.status != Status::Optimal) return r;
+        std::vector<int> keep;
+        for (int i = 0; i < m_; ++i)
+            if (i < m_base_ || root_basis_.status[n_ + i] != VarStatus::Basic) keep.push_back(i);
+        if (static_cast<int>(keep.size()) == m_) return r;
+        const int dropped = m_ - static_cast<int>(keep.size());
+        LpProblem t = *p_;
+        const auto *rp = p_->A.row_ptr();
+        const auto *ci = p_->A.col_ind();
+        const double *va = p_->A.values();
+        std::vector<int32_t> nrp{0}, nci;
+        std::vector<double> nva;
+        t.row_lb.clear();
+        t.row_ub.clear();
+        SimplexBasis warm;
+        warm.status.assign(root_basis_.status.begin(), root_basis_.status.begin() + n_);
+        for (int i : keep) {
+            for (int e = rp[i]; e < rp[i + 1]; ++e) { nci.push_back(ci[e]); nva.push_back(va[e]); }
+            nrp.push_back(static_cast<int32_t>(nci.size()));
+            t.row_lb.push_back(p_->row_lb[i]);
+            t.row_ub.push_back(p_->row_ub[i]);
+            warm.status.push_back(root_basis_.status[n_ + i]);
+        }
+        t.A = HostMatrix(keep.size(), static_cast<size_t>(n_), nrp, nci, nva);
+        pcut_ = std::move(t);
+        p_ = &pcut_;
+        m_ = static_cast<int>(keep.size());
+        At_ = pcut_.A.transpose();
+        simplex_.prepare(pcut_, lp_opt_);
+        SimplexBasis nb;
+        LpSolution nr = solve_lp(lb, ub, &warm, &nb);
+        if (nr.status != Status::Optimal) nr = solve_lp(lb, ub, nullptr, &nb);
+        if (nr.status == Status::Optimal) root_basis_ = std::move(nb);
+        if (o_->verbose)
+            std::printf("[milp] purged %d inactive cuts, %d kept\n", dropped, m_ - m_base_);
+        res_.cuts = m_ - m_base_;
+        return nr;
     }
 
     // ---- propagation -----------------------------------------------------------
