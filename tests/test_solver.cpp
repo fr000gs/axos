@@ -3,7 +3,7 @@
 // CPU build:   make test_solver_cpu
 // CUDA build:  make test_solver
 
-#ifdef AXOS_ENABLE_CUDA
+#ifdef PANINI_ENABLE_CUDA
 #include "tensorCuda.h"
 #endif
 #include "sparse/sparse.h"
@@ -16,8 +16,8 @@
 
 #include <sstream>
 
-using namespace AXOS;
-using namespace AXOS::Solver;
+using namespace Panini;
+using namespace Panini::Solver;
 
 static const int RUNS = 2;
 
@@ -318,7 +318,8 @@ test_presolve_singleton()
     b3.p.row_ub[0] = -6;
     b3.p.row_lb[1] = 1;
     LpProblem p3 = b3.build();
-    Presolve pre3(p3);
+    PresolveOptions keep_cols; keep_cols.parallel_cols = false; // the test feeds postsolve a reduced solution of fixed shape
+    Presolve pre3(p3, keep_cols);
     LpSolution r3;
     r3.status = Status::Optimal;
     r3.x = {3, 0};
@@ -394,10 +395,144 @@ test_presolve_other()
     // Options turn reductions off.
     PresolveOptions off;
     off.empty_rows = off.empty_cols = off.fixed_cols = off.singleton_rows =
-        off.duplicate_rows = false;
+        off.duplicate_rows = off.activity_rows = off.dual_fixing = off.singleton_cols =
+            off.doubleton_equations = off.aggregate = off.parallel_cols = false;
     Presolve none(p, off);
     tlog("SOLVER_PRESOLVE", "all reductions disabled leaves problem intact",
         none.reduced().rows() == 2 && none.reduced().cols() == 4, 0, 0);
+}
+
+// Random LPs rich in the structures the presolve rules target: every rule's
+// postsolve must give the same objective as a solve without presolve, with
+// primal and dual residuals at solver accuracy on the original problem.
+static void
+test_presolve_random()
+{
+    std::mt19937 g(77);
+    std::uniform_real_distribution<double> u(-1, 1), pos(0.5, 2);
+    int ok_count = 0, total = 0;
+    double worst = 0;
+    for (int trial = 0; trial < 40; ++trial) {
+        const int m0 = 12 + trial % 7, n0 = 18 + trial % 5;
+        const int extra_rows = 8, extra_cols = 8;
+        LpBuilder b(m0 + extra_rows, n0 + extra_cols);
+        // a feasible core: rows at a known point x0 >= 0, with slack either side
+        std::vector<double> x0(n0 + extra_cols);
+        for (auto &v : x0) v = pos(g);
+        for (int i = 0; i < m0; ++i) {
+            double act = 0;
+            for (int j = 0; j < n0; ++j)
+                if (u(g) > 0.55) { const double a = u(g); b.a(i, j, a); act += a * x0[j]; }
+            const int kind = static_cast<int>(g() % 3);
+            if (kind == 0) { b.p.row_lb[i] = b.p.row_ub[i] = act; }
+            else if (kind == 1) { b.p.row_lb[i] = act - pos(g); }
+            else { b.p.row_ub[i] = act + pos(g); }
+        }
+        for (int j = 0; j < n0; ++j) { b.p.c[j] = u(g) + 0.3; b.p.col_ub[j] = x0[j] + 3; }
+        int r = m0, c = n0;
+        // doubleton equations a x_j + b x_k = rhs (x_k a new column), incl. x_j + x_k = 0
+        for (int t = 0; t < 3; ++t, ++r, ++c) {
+            const int j = static_cast<int>(g() % n0);
+            const double a = u(g) >= 0 ? 1.0 : pos(g), bb = pos(g);
+            b.a(r, j, a).a(r, c, bb);
+            if (t == 0) { b.p.row_lb[r] = b.p.row_ub[r] = 0; b.p.col_ub[c] = kInf; } // forces x_j = x_c = 0 when a > 0
+            else { b.p.row_lb[r] = b.p.row_ub[r] = a * x0[j] + bb * x0[c]; b.p.col_ub[c] = x0[c] + 1; }
+            b.p.c[c] = u(g);
+            // the new column also appears in a core row
+            b.a(static_cast<int>(g() % m0), c, u(g));
+        }
+        // implied-free column singleton in an equality
+        {
+            const int j1 = static_cast<int>(g() % n0), j2 = static_cast<int>(g() % n0);
+            b.a(r, j1, 1).a(r, j2 == j1 ? (j1 + 1) % n0 : j2, 1).a(r, c, 1);
+            b.p.row_lb[r] = b.p.row_ub[r] = 100; // x_c = 100 - x_j1 - x_j2 >= 90 > 0
+            b.p.col_lb[c] = -kInf; b.p.col_ub[c] = kInf; b.p.c[c] = u(g);
+            ++r; ++c;
+        }
+        // free zero-cost singleton in an inequality
+        {
+            const int j1 = static_cast<int>(g() % n0);
+            b.a(r, j1, 1).a(r, c, 2);
+            b.p.row_lb[r] = -kInf; b.p.row_ub[r] = 1;
+            b.p.col_lb[c] = -kInf; b.p.col_ub[c] = kInf; b.p.c[c] = 0;
+            ++r; ++c;
+        }
+        // forcing row: sum of boxed columns at their lower bounds equals the upper bound
+        {
+            double lo = 0;
+            for (int t = 0; t < 3; ++t, ++c) {
+                b.a(r, c, 1); b.p.col_lb[c] = 1; b.p.col_ub[c] = 2; lo += 1; b.p.c[c] = u(g);
+                b.a(static_cast<int>(g() % m0), c, u(g));
+            }
+            b.p.row_ub[r] = lo;
+            ++r;
+        }
+        // redundant row
+        {
+            const int j1 = static_cast<int>(g() % n0);
+            b.a(r, j1, 1);
+            b.a(r, (j1 + 3) % n0, 1);
+            b.p.row_ub[r] = 1e4;
+            ++r;
+        }
+        for (; c < n0 + extra_cols; ++c) { b.p.c[c] = 1; b.p.col_ub[c] = 1; } // unused columns
+        for (; r < m0 + extra_rows; ++r) {}                                       // empty rows
+        LpProblem p = b.build();
+        SolverOptions on, off;
+        on.method = off.method = LpMethod::Simplex;
+        on.set_tolerance(1e-9);
+        off.set_tolerance(1e-9);
+        off.presolve = false;
+        LpSolution a = solve_lp<Cpu::HostStorage>(p, on), ref = solve_lp<Cpu::HostStorage>(p, off);
+        if (ref.status != Status::Optimal) continue; // the random core can be infeasible
+        ++total;
+        const double e = std::abs(a.primal_objective - ref.primal_objective) / (1 + std::abs(ref.primal_objective));
+        const double res = std::max(a.primal_residual, a.dual_residual);
+        worst = std::max({worst, e, res});
+        if (a.status == Status::Optimal && e < 1e-7 && res < 1e-7) ++ok_count;
+    }
+    tlog("SOLVER_PRESOLVE", ("random LPs: presolve + postsolve == no presolve (" +
+                                std::to_string(ok_count) + "/" + std::to_string(total) + ")").c_str(),
+        total >= 15 && ok_count == total, worst, 0);
+}
+
+// Parallel columns: proportional entries and costs are merged, postsolve splits
+// the merged variable inside both columns' bounds (also for a negative factor).
+static void
+test_presolve_parallel()
+{
+    for (double alpha : {2.0, -2.0}) {
+        // min x1 + alpha x2 + 3 x3   (cost of x2 = alpha * cost of x1)
+        // s.t. r1: x1 + alpha x2 + x3 >= 4 ; r2: x1 + alpha x2 <= 10
+        // x1 in [0,1], x2 in [0,3] (w = x1 + alpha x2), x3 >= 0 at cost 3.
+        LpBuilder b(2, 3);
+        b.a(0, 0, 1).a(0, 1, alpha).a(0, 2, 1).a(1, 0, 1).a(1, 1, alpha);
+        b.p.c = {1, alpha * 1, 3};
+        b.p.col_ub = {1, 3, kInf};
+        b.p.row_lb = {4, -kInf};
+        b.p.row_ub = {kInf, 10};
+        LpProblem p = b.build();
+        Presolve pre(p);
+        SolverOptions o;
+        o.method = LpMethod::Simplex;
+        o.set_tolerance(1e-9);
+        LpSolution s = solve_lp<Cpu::HostStorage>(p, o);
+        LpSolution ref;
+        {
+            SolverOptions off = o;
+            off.presolve = false;
+            ref = solve_lp<Cpu::HostStorage>(p, off);
+        }
+        const bool in_bounds = s.x.size() == 3 && s.x[0] >= -1e-9 && s.x[0] <= 1 + 1e-9 &&
+                               s.x[1] >= -1e-9 && s.x[1] <= 3 + 1e-9 && s.x[2] >= -1e-9;
+        tlog("SOLVER_PRESOLVE", (std::string("parallel columns merged and split (factor ") +
+                                    (alpha > 0 ? "+2" : "-2") + ")").c_str(),
+            pre.removed_cols() >= 1 && s.status == Status::Optimal &&
+                ref.status == Status::Optimal && in_bounds &&
+                std::abs(s.primal_objective - ref.primal_objective) < 1e-8 &&
+                s.primal_residual < 1e-9 && s.dual_residual < 1e-9,
+            std::abs(s.primal_objective - ref.primal_objective), 0);
+    }
 }
 
 static void
@@ -431,7 +566,8 @@ test_presolve_duplicates()
     b2.p.c = {-1, -1};
     b2.p.row_ub = {4, -1};
     LpProblem p2 = b2.build();
-    Presolve pre2(p2);
+    PresolveOptions keep_cols; keep_cols.parallel_cols = false; // see above: fixed-shape hand-fed solution
+    Presolve pre2(p2, keep_cols);
     LpSolution r2;
     r2.status = Status::Optimal;
     r2.x = {4, 0};
@@ -974,6 +1110,55 @@ test_basis_factor()
         }
     }
     tlog("SOLVER_SIMPLEX", "basis LU: ftran/btran with eta updates and refactorization", ok, worst, 0);
+    // larger sparse bases (slack-heavy, like simplex bases), some with dependent
+    // columns: after replacing each reported column by the slack of its free
+    // row the factorization is exact
+    {
+        bool ok2 = true;
+        double worst2 = 0;
+        for (int trial = 0; trial < 12; ++trial) {
+            const int m = 50 + 40 * trial;
+            std::uniform_int_distribution<int> row(0, m - 1);
+            std::vector<std::vector<int>> I(m);
+            std::vector<std::vector<double>> V(m);
+            for (int j = 0; j < m; ++j) {
+                if (u(g) < 0.3) { I[j] = {j}; V[j] = {1.0}; continue; } // slack
+                const int nz = 1 + static_cast<int>(g() % 6);
+                std::vector<int> rows;
+                for (int t = 0; t < nz; ++t) rows.push_back(row(g));
+                std::sort(rows.begin(), rows.end());
+                rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+                for (int r : rows) { I[j].push_back(r); V[j].push_back(u(g) * 10); }
+            }
+            if (trial % 3 == 2) { I[m - 1] = I[0]; V[m - 1] = V[0]; } // dependent column
+            BasisFactor bf;
+            std::vector<int> sing, freerow;
+            for (int round = 0; round < 10; ++round) {
+                std::vector<BasisFactor::Column> C(m);
+                for (int j = 0; j < m; ++j) C[j] = {I[j].data(), V[j].data(), static_cast<int>(I[j].size())};
+                if (bf.factor(m, C, sing, freerow) == 0) break;
+                for (size_t t = 0; t < sing.size(); ++t) {
+                    I[sing[t]] = {freerow[t]};
+                    V[sing[t]] = {1.0};
+                }
+            }
+            Eigen::MatrixXd B = Eigen::MatrixXd::Zero(m, m);
+            for (int j = 0; j < m; ++j)
+                for (size_t t = 0; t < I[j].size(); ++t) B(I[j][t], j) += V[j][t];
+            Eigen::VectorXd b(m);
+            for (int i = 0; i < m; ++i) b(i) = u(g);
+            std::vector<double> x(b.data(), b.data() + m), y(b.data(), b.data() + m);
+            bf.ftran(x);
+            bf.btran(y);
+            Eigen::VectorXd xv = Eigen::Map<Eigen::VectorXd>(x.data(), m);
+            Eigen::VectorXd yv = Eigen::Map<Eigen::VectorXd>(y.data(), m);
+            const double e = std::max((B * xv - b).norm(), (B.transpose() * yv - b).norm()) /
+                             (1 + b.norm());
+            worst2 = std::max(worst2, e);
+            ok2 = ok2 && e < 1e-9;
+        }
+        tlog("SOLVER_SIMPLEX", "basis LU: sparse bases with dependent columns (residual)", ok2, worst2, 0);
+    }
     // a singular basis is reported, with a replacement row
     {
         std::vector<int> i0{0, 1}, i1{0, 1}, i2{2};
@@ -1067,11 +1252,83 @@ test_simplex_degenerate()
     tlog("SOLVER_SIMPLEX", "degenerate transportation problems: simplex == interior point", ok, worst, 0);
 }
 
+// Concurrent Auto agrees with the sequential strategy; a preset stop flag
+// interrupts every method.
+template <template <typename> class Store>
+static void
+test_concurrent_auto(const char *cat)
+{
+    std::mt19937 g(33);
+    bool ok = true;
+    double worst = 0;
+    for (int trial = 0; trial < 4; ++trial) {
+        const size_t S = 10 + 3 * trial, D = 12 + 2 * trial;
+        std::uniform_int_distribution<int> cost(1, 30), amt(2, 12);
+        LpBuilder b(S + D, S * D);
+        for (size_t i = 0; i < S; ++i)
+            for (size_t j = 0; j < D; ++j) {
+                b.a(i, i * D + j, 1).a(S + j, i * D + j, 1);
+                b.p.c[i * D + j] = cost(g);
+            }
+        for (size_t i = 0; i < S; ++i) { b.p.row_lb[i] = -kInf; b.p.row_ub[i] = amt(g) + 6; }
+        for (size_t j = 0; j < D; ++j) { b.p.row_lb[S + j] = amt(g); b.p.row_ub[S + j] = kInf; }
+        LpProblem p = b.build();
+        SolverOptions oc, os;
+        oc.method = os.method = LpMethod::Auto;
+        oc.set_tolerance(1e-8);
+        os.set_tolerance(1e-8);
+        os.concurrent = false;
+        LpSolution a = solve_lp<Store>(p, oc), c = solve_lp<Store>(p, os);
+        const double e = std::abs(a.primal_objective - c.primal_objective) / (1 + std::abs(c.primal_objective));
+        worst = std::max(worst, e);
+        ok = ok && a.status == c.status && (a.status != Status::Optimal || e < 1e-7) &&
+             a.duals_verified && c.duals_verified;
+    }
+    tlog(cat, "concurrent Auto == sequential Auto", ok, worst, 0);
+    // infeasible: the simplex certificate wins the race
+    {
+        LpBuilder b(2, 2);
+        b.a(0, 0, 1).a(0, 1, 1).a(1, 0, 1).a(1, 1, 1);
+        b.p.c = {1, 1};
+        b.p.row_lb = {3, -kInf};
+        b.p.row_ub = {kInf, 1};
+        LpProblem p = b.build();
+        SolverOptions o;
+        o.method = LpMethod::Auto;
+        o.presolve = false;
+        LpSolution s = solve_lp<Store>(p, o);
+        tlog(cat, "concurrent Auto detects infeasibility", s.status == Status::Infeasible, 0, 0,
+            to_string(s.status));
+    }
+    // a stop flag that is already set: every method returns Interrupted
+    {
+        LpBuilder b(3, 4);
+        b.a(0, 0, 1).a(0, 1, 2).a(1, 1, 1).a(1, 2, 3).a(2, 2, 1).a(2, 3, 1).a(2, 0, 1);
+        b.p.c = {1, 2, 3, 1};
+        b.p.row_lb = {2, 1, 1};
+        b.p.row_ub = {kInf, kInf, kInf};
+        LpProblem p = b.build();
+        StopFlag stop;
+        stop.set();
+        bool all = true;
+        for (LpMethod m : {LpMethod::Pdlp, LpMethod::Ipm, LpMethod::Simplex, LpMethod::Auto}) {
+            SolverOptions o;
+            o.method = m;
+            o.presolve = false;
+            o.interrupt = &stop;
+            o.check_frequency = 1;
+            LpSolution s = solve_lp<Store>(p, o);
+            all = all && s.status == Status::Interrupted;
+        }
+        tlog(cat, "stop flag interrupts every method", all, 0, 0);
+    }
+}
+
 int
 main(int argc, char *argv[])
 {
     headless = parse_headless(argc, argv);
-    if (headless) printf("--- AXOS solver test suite ---\n");
+    if (headless) printf("--- tensorPanini solver test suite ---\n");
     for (int run = 0; run < RUNS; ++run) {
         if (headless) printf("\n═══ RUN %d/%d ═══\n", run + 1, RUNS);
         test_mps_read();
@@ -1081,16 +1338,22 @@ main(int argc, char *argv[])
         test_presolve_singleton();
         test_presolve_other();
         test_presolve_duplicates();
+        test_presolve_parallel();
+        test_presolve_random();
         test_known_generator();
         test_scaling_invariance();
         test_netlib_models();
         test_basis_factor();
         test_simplex_warm_start();
         test_simplex_degenerate();
+        test_concurrent_auto<Cpu::HostStorage>("SOLVER_AUTO_CPU");
+#ifdef PANINI_ENABLE_CUDA
+        test_concurrent_auto<Cuda::CudaStorage>("SOLVER_AUTO_CUDA");
+#endif
         test_lp_solves<Cpu::HostStorage>("SOLVER_SIMPLEX_CPU", LpMethod::Simplex);
         test_lp_solves<Cpu::HostStorage>("SOLVER_LP_CPU");
         test_lp_solves<Cpu::HostStorage>("SOLVER_IPM_CPU", LpMethod::Ipm);
-#ifdef AXOS_ENABLE_CUDA
+#ifdef PANINI_ENABLE_CUDA
         test_lp_solves<Cuda::CudaStorage>("SOLVER_LP_CUDA");
         test_lp_solves<Cuda::CudaStorage>("SOLVER_IPM_CUDA", LpMethod::Ipm);
 #endif

@@ -20,6 +20,10 @@
 // is verified on the original problem by evaluate_solution().
 #pragma once
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "solver/lp/basis_lu.h"
 #include "solver/model.h"
 #include "solver/scaling.h"
@@ -28,7 +32,7 @@
 #include <cstdio>
 #include <random>
 
-namespace AXOS {
+namespace Panini {
 namespace Solver {
 
 enum class VarStatus : int8_t { Basic = 0, AtLower = 1, AtUpper = 2, AtZero = 3 };
@@ -36,6 +40,36 @@ enum class VarStatus : int8_t { Basic = 0, AtLower = 1, AtUpper = 2, AtZero = 3 
 struct SimplexBasis {
     std::vector<VarStatus> status; // size n + m (columns then row slacks)
     bool valid() const { return !status.empty(); }
+};
+
+// Decides when to refactor the basis: the average cost per iteration over a
+// refactorization cycle, (T_factor + sum of iteration times) / k, is minimal
+// where the current iteration time crosses that average (iterations get slower
+// as the eta file grows). Iteration times are smoothed over a few iterations.
+struct RefactorPolicy {
+    using clock = std::chrono::steady_clock;
+    double t_factor = 0, sum = 0, smooth = 0;
+    // > 1 refactors later: large hypersparse bases have noisy iteration times that would
+    // otherwise trigger early, and their refactorization is expensive (46% of mcf50k)
+    double margin = 1.0;
+    int k = 0;
+    clock::time_point t0 = clock::now();
+
+    void begin_cycle(double factor_seconds) { t_factor = factor_seconds; sum = 0; smooth = 0; k = 0; t0 = clock::now(); }
+    // call once per iteration; returns true when a refactorization pays off
+    bool
+    tick(int max_updates)
+    {
+        const auto t1 = clock::now();
+        const double dt = std::chrono::duration<double>(t1 - t0).count();
+        t0 = t1;
+        ++k;
+        sum += dt;
+        smooth = k == 1 ? dt : 0.8 * smooth + 0.2 * dt;
+        if (k >= max_updates) return true;
+        if (k < 15) return false;
+        return smooth > margin * (t_factor + sum) / k;
+    }
 };
 
 class DualSimplex {
@@ -126,6 +160,9 @@ class DualSimplex {
     std::vector<double> slack_val_;
     // ---- simplex state ------------------------------------------------------
     std::vector<double> x_, d_, y_, dse_, pinf_;
+    std::vector<uint8_t> active_;
+    std::vector<std::vector<int>> price_buf_;
+    std::vector<int> cbuf_;
     std::vector<VarStatus> status_;
     std::vector<int> head_, pos_;
     BasisFactor bf_;
@@ -342,6 +379,9 @@ class DualSimplex {
         SVec e;
         e.init(m_);
         for (int k = 0; k < m_; ++k) {
+            // m BTRANs can take long on big bases: keep the old weights for the
+            // rest when out of time or interrupted
+            if ((k & 255) == 0 && (elapsed() > opt_->time_limit || opt_->interrupted())) return;
             e.clear();
             e.set(k, 1.0);
             bf_.btran(e);
@@ -351,8 +391,18 @@ class DualSimplex {
         }
     }
 
+    // active_[j]: nonbasic and not fixed for the bounds of the running loop.
+    // Only these entries of a pivot row are ever used.
+    void
+    rebuild_active(const std::vector<double> &LB, const std::vector<double> &UB)
+    {
+        active_.resize(N_);
+        for (int j = 0; j < N_; ++j)
+            active_[j] = status_[j] != VarStatus::Basic && LB[j] != UB[j];
+    }
+
     // rho = B^-T e_r and the pivot row arow = rho^T [A -I], built sparsely:
-    // aidx lists the (possibly) nonzero entries of arow (basic ones included).
+    // aidx lists the (possibly) nonzero entries of arow, active columns only.
     void
     pivot_row(int r, SVec &rho, std::vector<double> &arow, std::vector<int> &aidx)
     {
@@ -372,6 +422,7 @@ class DualSimplex {
                 if (ri == 0.0) continue;
                 for (int k = rp[i]; k < rp[i + 1]; ++k) {
                     const int j = ci[k];
+                    if (!active_[j]) continue; // basic or fixed: never needed
                     if (arow[j] == 0.0) aidx.push_back(j);
                     arow[j] += ri * va[k];
                     if (arow[j] == 0.0) arow[j] = 1e-300; // keep the pattern entry
@@ -380,14 +431,35 @@ class DualSimplex {
         } else {
             const int *rp = AT_.row_ptr(), *ci = AT_.col_ind();
             const double *va = AT_.values();
-            for (int j = 0; j < n_; ++j) {
-                double sj = 0;
-                for (int k = rp[j]; k < rp[j + 1]; ++k) sj += rho.v[ci[k]] * va[k];
-                if (sj != 0.0) { arow[j] = sj; aidx.push_back(j); }
-            }
+            // one pass over all of A: split over threads for large problems
+            auto cols = [&](int j0, int j1, std::vector<int> &out) {
+                for (int j = j0; j < j1; ++j) {
+                    if (!active_[j]) continue;
+                    double sj = 0;
+                    for (int k = rp[j]; k < rp[j + 1]; ++k) sj += rho.v[ci[k]] * va[k];
+                    if (sj != 0.0) { arow[j] = sj; out.push_back(j); }
+                }
+            };
+#ifdef _OPENMP
+            const int T = omp_get_max_threads();
+            if (T > 1 && A_->nnz() > 200000) {
+                price_buf_.resize(T);
+#pragma omp parallel num_threads(T)
+                {
+                    const int t = omp_get_thread_num(), nt = omp_get_num_threads();
+                    std::vector<int> &out = price_buf_[t];
+                    out.clear();
+                    const int j0 = static_cast<int>(static_cast<long>(n_) * t / nt);
+                    const int j1 = static_cast<int>(static_cast<long>(n_) * (t + 1) / nt);
+                    cols(j0, j1, out);
+                }
+                for (auto &b : price_buf_) aidx.insert(aidx.end(), b.begin(), b.end());
+            } else
+#endif
+                cols(0, n_, aidx);
         }
         for (int i : rho.idx)
-            if (rho.v[i] != 0.0) { arow[n_ + i] = -rho.v[i]; aidx.push_back(n_ + i); }
+            if (rho.v[i] != 0.0 && active_[n_ + i]) { arow[n_ + i] = -rho.v[i]; aidx.push_back(n_ + i); }
     }
 
     // squared primal infeasibility of the basic variable at position k
@@ -414,7 +486,10 @@ class DualSimplex {
     Status
     dual_loop(const std::vector<double> &LB, const std::vector<double> &UB, bool phase1)
     {
-        const int refactor_freq = std::min(500, std::max(100, m_ / 100));
+        const int refactor_max = 2000; // safety cap on eta-file length
+        RefactorPolicy policy;
+        policy.margin = m_ > 10000 ? 2.0 : 1.0;
+        bool policy_refactor = false;
         SVec rho, colq, tau, rhs;
         rho.init(m_); colq.init(m_); tau.init(m_); rhs.init(m_);
         std::vector<double> arow(N_, 0.0);
@@ -452,10 +527,15 @@ class DualSimplex {
         while (true) {
             if (iters_ >= opt_->max_iterations) return Status::IterationLimit;
             if ((iters_ & 15) == 0 && elapsed() > opt_->time_limit) return Status::TimeLimit;
-            if (need_refactor || bf_.updates() >= refactor_freq || bf_.eta_heavy(2.0)) {
+            if ((iters_ & 15) == 0 && opt_->interrupted()) return Status::Interrupted;
+            if (need_refactor || policy_refactor || bf_.eta_heavy(8.0)) {
+                const auto tf0 = std::chrono::steady_clock::now();
                 if (!refactor()) return Status::NumericalError;
+                policy_refactor = false;
                 compute_primal(LB, UB);
                 compute_dual();
+                rebuild_active(LB, UB);
+                policy.begin_cycle(std::chrono::duration<double>(std::chrono::steady_clock::now() - tf0).count());
                 need_refactor = false;
                 fresh = true;
                 if (dse_bad_) { dse_bad_ = false; rebuild_dse(); }
@@ -510,20 +590,32 @@ class DualSimplex {
             // ---- BTRAN and pivot row ----------------------------------------
             pivot_row(r, rho, arow, aidx);
             // ---- candidates for entering ------------------------------------
-            cand.clear();
+            // branch-free scan (the status/sign test is unpredictable)
+            if (cbuf_.size() < aidx.size()) cbuf_.resize(N_); // grown once, never zero-filled again
             double amax = 0;
-            for (int j : aidx)
-                if (status_[j] != VarStatus::Basic) amax = std::max(amax, std::abs(arow[j]));
-            const double pivtol = 1e-7 * std::max(1.0, amax);
-            for (int j : aidx) {
-                const VarStatus st = status_[j];
-                if (st == VarStatus::Basic) continue;
-                const double at = below ? -arow[j] : arow[j];
-                if (LB[j] == UB[j]) continue;
-                if ((st == VarStatus::AtLower && at > pivtol) ||
-                    (st == VarStatus::AtUpper && at < -pivtol) ||
-                    (st == VarStatus::AtZero && std::abs(at) > pivtol))
-                    cand.push_back(j);
+            {
+                const double sgn = below ? -1.0 : 1.0;
+                size_t w = 0;
+                int *cb = cbuf_.data();
+                for (int j : aidx) { // active entries only: nonbasic, not fixed
+                    const double a = arow[j];
+                    amax = std::max(amax, std::abs(a));
+                    const double at = sgn * a;
+                    const VarStatus st = status_[j];
+                    const bool keep = (st == VarStatus::AtLower) & (at > 0);
+                    const bool keep2 = (st == VarStatus::AtUpper) & (at < 0);
+                    const bool keep3 = (st == VarStatus::AtZero) & (at != 0);
+                    cb[w] = j;
+                    w += static_cast<size_t>(keep | keep2 | keep3);
+                }
+                cand.assign(cb, cb + w);
+            }
+            {
+                const double pivtol = 1e-7 * std::max(1.0, amax);
+                size_t w = 0;
+                for (int j : cand)
+                    if (std::abs(arow[j]) > pivtol) cand[w++] = j;
+                cand.resize(w);
             }
             if (cand.empty()) return Status::Infeasible;
             auto ratio = [&](int j) {
@@ -625,10 +717,7 @@ class DualSimplex {
             x_[p] = target;
 
             // ---- dual update ----------------------------------------------------
-            for (int j : aidx) {
-                if (status_[j] == VarStatus::Basic) continue;
-                d_[j] -= theta_d * arow[j];
-            }
+            for (int j : aidx) d_[j] -= theta_d * arow[j]; // active entries only
             d_[q] = 0.0;
             d_[p] = -theta_d;
             // wrong-signed reduced costs left by the Harris step: shift costs
@@ -671,6 +760,8 @@ class DualSimplex {
             head_[r] = q;
             pos_[q] = r;
             pos_[p] = -1;
+            active_[q] = 0;
+            active_[p] = LB[p] != UB[p];
             status_[q] = VarStatus::Basic;
             status_[p] = (LB[p] == UB[p] || below) ? VarStatus::AtLower : VarStatus::AtUpper;
             set_pinf(r, LB, UB);
@@ -689,13 +780,14 @@ class DualSimplex {
             if (!bf_.update(r, colq)) need_refactor = true;
             ++iters_;
             if (dse_bad_) need_refactor = true;
+            if (policy.tick(refactor_max)) policy_refactor = true;
             if (opt_->verbose && (iters_ % 200 == 0))
                 std::printf("[simplex] it %ld  |infeas| %.3e  theta_d %.2e  etas %d%s\n",
                     iters_, std::abs(delta), theta_d, bf_.updates(),
                     phase1 ? "  (phase 1)" : "");
 
             // ---- stall handling: perturb costs ------------------------------------
-            if (!phase1 && !perturbed_ && degenerate > 60) perturb();
+            if (!perturbed_ && degenerate > 60) perturb(); // also in phase 1: it has the true costs
         }
     }
 
@@ -707,7 +799,10 @@ class DualSimplex {
     Status
     primal_loop(const std::vector<double> &LB, const std::vector<double> &UB)
     {
-        const int refactor_freq = std::min(500, std::max(100, m_ / 100));
+        const int refactor_max = 2000;
+        RefactorPolicy policy;
+        policy.margin = m_ > 10000 ? 2.0 : 1.0;
+        bool policy_refactor = false;
         SVec rho;
         rho.init(m_);
         std::vector<double> colq(m_), arow(N_, 0.0), w(N_, 1.0);
@@ -717,10 +812,15 @@ class DualSimplex {
         while (true) {
             if (iters_ >= opt_->max_iterations) return Status::IterationLimit;
             if ((iters_ & 63) == 0 && elapsed() > opt_->time_limit) return Status::TimeLimit;
-            if (need_refactor || bf_.updates() >= refactor_freq || bf_.eta_heavy(2.0)) {
+            if ((iters_ & 15) == 0 && opt_->interrupted()) return Status::Interrupted;
+            if (need_refactor || policy_refactor || bf_.eta_heavy(8.0)) {
+                const auto tf0 = std::chrono::steady_clock::now();
                 if (!refactor()) return Status::NumericalError;
+                policy_refactor = false;
                 compute_primal(LB, UB);
                 compute_dual();
+                rebuild_active(LB, UB);
+                policy.begin_cycle(std::chrono::duration<double>(std::chrono::steady_clock::now() - tf0).count());
                 need_refactor = false;
                 fresh = true;
             }
@@ -827,10 +927,13 @@ class DualSimplex {
             head_[r] = q;
             pos_[q] = r;
             pos_[p] = -1;
+            active_[q] = 0;
+            active_[p] = LB[p] != UB[p];
             status_[q] = VarStatus::Basic;
             status_[p] = (LB[p] == UB[p] || p_to_lower) ? VarStatus::AtLower : VarStatus::AtUpper;
             if (!bf_.update(r, colq)) need_refactor = true;
             ++iters_;
+            if (policy.tick(refactor_max)) policy_refactor = true;
             if (opt_->verbose && (iters_ % 200 == 0))
                 std::printf("[simplex] it %ld  primal  d_q %.3e  etas %d\n", iters_, d_[q], bf_.updates());
         }
@@ -991,4 +1094,4 @@ class DualSimplex {
 };
 
 } // namespace Solver
-} // namespace AXOS
+} // namespace Panini

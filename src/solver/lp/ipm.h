@@ -33,7 +33,7 @@
 #include <chrono>
 #include <cstdio>
 
-namespace AXOS {
+namespace Panini {
 namespace Solver {
 
 template <template <typename> class Store = Cpu::HostStorage> class Ipm {
@@ -45,6 +45,9 @@ template <template <typename> class Store = Cpu::HostStorage> class Ipm {
     using Ldl = Sparse::SparseLdlt<double, int32_t, Store>;
 
   public:
+    // true when the last solve() used the normal equations (CPU)
+    bool used_normal() const { return used_normal_; }
+
     // Solves p (no presolve). Requires at least one row and one column, no
     // free rows and no fixed columns (solve_lp() takes care of that).
     LpSolution
@@ -164,7 +167,8 @@ template <template <typename> class Store = Cpu::HostStorage> class Ipm {
                                   : Sparse::Ordering::MinDegree);
         bool analyzed = false;
         std::unique_ptr<NormalKkt> nk; // normal-equations alternative (CPU)
-        bool use_normal = false;
+        bool &use_normal = used_normal_;
+        use_normal = false;
 
         // ---- norms for the relative termination tests --------------------
         double nb = 0, nc = 0;
@@ -272,6 +276,7 @@ template <template <typename> class Store = Cpu::HostStorage> class Ipm {
             if (it >= opt.ipm_max_iterations)
                 return finish(Status::IterationLimit, it);
             if (elapsed() > opt.time_limit) return finish(Status::TimeLimit, it);
+            if (opt.interrupted()) return finish(Status::Interrupted, it);
 
             if (mu > 0)
                 par.for_each(N, Recenter{sl.data, su.data, tl.data, tu.data,
@@ -290,48 +295,75 @@ template <template <typename> class Store = Cpu::HostStorage> class Ipm {
                     double kkt_flops = 0;
                     bool aug_analyzed = false;
                     if constexpr (std::is_same_v<Store<double>, Cpu::HostStorage<double>>) {
-                        // the normal equations are analyzed first: when cheap they are
-                        // used without the (much larger) augmented analysis
+                        // Choose between the normal equations and the augmented system
+                        // from cheap symbolic estimates (early exit past the flops cap);
+                        // only the chosen system is analyzed in full, and nothing is
+                        // when both exceed opt.ipm_max_flops.
+                        const double cap = opt.ipm_max_flops;
+                        double f_norm = 1e300, f_aug = 1e300;
+                        // the orderings behind the estimates can take seconds on big
+                        // problems: they honour the time limit and the interrupt
+                        const std::function<bool()> stop_symbolic = [&] {
+                            return opt.interrupted() || elapsed() > opt.time_limit;
+                        };
                         if (opt.ipm_normal >= 0) {
                             nk.reset(new NormalKkt(q, opt.ipm_ordering == 1
                                                           ? Sparse::Ordering::NestedDissection
                                                           : Sparse::Ordering::MinDegree));
-                            if (opt.verbose) std::printf("[ipm] normal pattern built at %.0f ms, eligible %d\n", (elapsed() - ta) * 1000, (int)nk->eligible());
-                            bool nk_ok = nk->eligible();
-                            if (nk_ok) {
-                                try { nk->analyze(); }
-                                catch (const std::bad_alloc &) { nk_ok = false; }
-                            }
-                            if (nk_ok) {
-                                if (opt.verbose) std::printf("[ipm] normal analyzed at %.0f ms\n", (elapsed() - ta) * 1000);
-                                kkt_flops = nk->factor_flops();
-                                if (opt.ipm_normal == 1 || kkt_flops < 2e9 ||
-                                    (opt.ipm_max_flops > 0 && kkt_flops > 50 * opt.ipm_max_flops)) {
-                                    // cheap, or hopeless (the augmented system has about
-                                    // the same fill): no need to analyze it as well
-                                    use_normal = true;
-                                } else {
-                                    ldl.analyze(K);
-                                    aug_analyzed = true;
-                                    if (opt.verbose)
-                                        std::printf("[ipm] normal equations: %.3e flops vs augmented %.3e\n",
-                                            kkt_flops, ldl.factor_flops());
-                                    if (kkt_flops < 0.5 * ldl.factor_flops()) use_normal = true;
-                                    else kkt_flops = ldl.factor_flops();
-                                }
-                            }
+                            if (nk->eligible()) f_norm = nk->estimate_flops(cap, stop_symbolic);
                         }
-                        if (!use_normal && !aug_analyzed) {
-                            try {
-                                ldl.analyze(K);
-                                kkt_flops = ldl.factor_flops();
-                            } catch (const std::bad_alloc &) { // factors do not fit in memory
+                        // no dense columns (normal equations eligible) makes the augmented
+                        // system rarely cheaper: estimate it only when the normal
+                        // equations are not usable or exceed the cap
+                        const bool normal_ok = nk && nk->eligible() &&
+                                               (opt.ipm_normal == 1 || cap <= 0 || f_norm <= cap);
+                        if (!normal_ok)
+                            f_aug = Sparse::symbolic_ldl_flops<int32_t>(N2, krp.data(), kci.data(),
+                                cap, stop_symbolic);
+                        use_normal = normal_ok || (nk && nk->eligible() && f_norm < f_aug);
+                        kkt_flops = use_normal ? f_norm : f_aug;
+                        if (!std::isfinite(kkt_flops)) // ordering stopped early
+                            return finish(opt.interrupted() ? Status::Interrupted : Status::TimeLimit, 0);
+                        if (opt.verbose)
+                            std::printf("[ipm] est. flops: normal %.3e augmented %.3e (%.0f ms)\n",
+                                f_norm, f_aug, (elapsed() - ta) * 1000);
+                        if (cap > 0 && kkt_flops > cap) {
+                            if (opt.verbose)
+                                std::printf("[ipm] factorization needs %.2e flops (limit %.2e): giving up\n",
+                                    kkt_flops, cap);
+                            LpSolution ns = finish(Status::NotSolved, 0);
+                            ns.factor_flops = kkt_flops;
+                            return ns;
+                        }
+                        try {
+                            if (use_normal) nk->analyze();
+                            else ldl.analyze(K);
+                        } catch (const std::bad_alloc &) { // factors do not fit in memory
+                            LpSolution ns = finish(Status::NotSolved, 0);
+                            ns.factor_flops = 1e300;
+                            return ns;
+                        }
+                        (void)aug_analyzed;
+                        if (opt.interrupt) {
+                            auto cancel = [&opt] { return opt.interrupted(); };
+                            ldl.set_cancel(cancel);
+                            if (nk) nk->set_cancel(cancel);
+                        }
+                    } else {
+                        // no symbolic statistics from cuDSS: estimate the cost on the host
+                        if (opt.ipm_max_flops > 0) {
+                            const double f = Sparse::symbolic_ldl_flops<int32_t>(
+                                N2, krp.data(), kci.data(), opt.ipm_max_flops,
+                                [&] { return opt.interrupted() || elapsed() > opt.time_limit; });
+                            if (opt.verbose)
+                                std::printf("[ipm] est. factor flops %.3e (limit %.2e)\n", f,
+                                    opt.ipm_max_flops);
+                            if (f > opt.ipm_max_flops) {
                                 LpSolution ns = finish(Status::NotSolved, 0);
-                                ns.factor_flops = 1e300;
+                                ns.factor_flops = f;
                                 return ns;
                             }
                         }
-                    } else {
                         ldl.analyze(K);
                     }
                     if constexpr (std::is_same_v<Store<double>, Cpu::HostStorage<double>>) {
@@ -361,11 +393,13 @@ template <template <typename> class Store = Cpu::HostStorage> class Ipm {
                 }
                 if (opt.verbose)
                     std::printf("[ipm]        factorize %.0f ms\n", (elapsed() - tf) * 1000);
-                if (opt.verbose && std::getenv("AXOS_MF_PROFILE")) {
+                if (opt.verbose && std::getenv("PANINI_MF_PROFILE")) {
                     if (use_normal) nk->print_profile(); else ldl.print_profile();
                 }
+                if (!factored && opt.interrupted()) break;
                 if (!factored) { rho *= 100; delta *= 100; }
             }
+            if (!factored && opt.interrupted()) return finish(Status::Interrupted, it);
             if (!factored) return finish(Status::NumericalError, it);
 
             // ---- predictor -----------------------------------------------
@@ -432,7 +466,10 @@ template <template <typename> class Store = Cpu::HostStorage> class Ipm {
         }
         return finish(Status::IterationLimit, opt.ipm_max_iterations);
     }
+
+  private:
+    bool used_normal_ = false;
 };
 
 } // namespace Solver
-} // namespace AXOS
+} // namespace Panini

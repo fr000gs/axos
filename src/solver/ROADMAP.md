@@ -1,7 +1,7 @@
-# AXOS optimization solver: roadmap
+# Panini optimization solver: roadmap
 
 The goal is LP, then MILP, QP, MIQP and (convex) MINLP solvers built on
-AXOS tensors, with CPU and CUDA backends. Vulkan is out of scope for now.
+Panini tensors, with CPU and CUDA backends. Vulkan is out of scope for now.
 
 Each stage lists what it needs from earlier stages, what gets built, and
 what "done" means. The stages are ordered by dependency, and the order
@@ -106,6 +106,8 @@ differs from the list above:
 
 ### 1a. Model, I/O, presolve, scaling
 
+(Presolve was extended after the first pass, see below.)
+
 - Model: minimize cᵀx subject to l_r ≤ Ax ≤ u_r and l_c ≤ x ≤ u_c, with
   infinite bounds allowed. This single form covers equality, inequality and
   free rows without converting between them.
@@ -206,11 +208,17 @@ system; every complementarity pair is kept centered (Ipopt's safeguard).
 **Status: done** (`src/solver/lp/simplex.h`, `basis_lu.h`; `LpMethod::Simplex`).
 CPU bounded-variable dual simplex:
 
-- Basis: sparse LU (Gilbert-Peierls, threshold pivoting, columns ordered by
-  count) with product-form eta updates; FTRAN/BTRAN are hypersparse (symbolic
-  DFS reach over L, U and their row-wise copies) when the vector is sparse. The
-  factorization is redone every 100-500 updates or when the eta file outgrows
-  the factors. (Forrest-Tomlin was not needed to reach the numbers below.)
+- Basis: sparse LU with Markowitz pivoting (right-looking, threshold 0.1,
+  count buckets, search limited to 4 candidates; singletons first so slack and
+  network parts of a basis are eliminated without fill; the previous
+  Gilbert-Peierls LU with column-count ordering had no fill control) and
+  product-form eta updates; FTRAN/BTRAN are hypersparse (symbolic DFS reach over
+  L, U and their row-wise copies) when the vector is sparse. The basis is
+  refactored when the measured iteration time crosses the running average cost
+  per iteration of the cycle ((T_factor + sum of iteration times)/k is minimal
+  there), so no constant is tuned per model. Forrest-Tomlin was measured and
+  NOT built: eta handling is 1.4% of the time on mcf50k and 3-10% elsewhere, the
+  rest is spread over the factorization, the reach DFS and pricing loops.
 - Pricing: dual steepest edge with the exact weight of the leaving row taken
   from BTRAN and a rebuild of all weights when the updated one drifts (the weights
   collapsing to their floor was the cause of 3-4x too many iterations).
@@ -228,12 +236,46 @@ CPU bounded-variable dual simplex:
   start (25fv47: 1562 iterations vs 2107 cold): the basis from the IPM point is
   ill-conditioned (max primal infeasibility 1e7 on 25fv47). A real crossover
   (primal/dual push phases) is not done.
-- Not done: Forrest-Tomlin updates, partial/hyper-sparse pricing beyond the
-  CHUZR list, dual phase 1 with subproblem approach, parallelism. Per-iteration
-  cost on large network problems is about 3x HiGHS (mcf50k: 180 us vs 55 us).
-- Netlib: 25/25 (19 optimal to 1e-7..1e-9, 6 infeasible detected); times within
-  1.2-2.4x of HiGHS except greenbea (5.6x). Larger instances: transport700
-  2.0 s (HiGHS 1.5 s), mcf10k 0.8 s (0.4 s), mcf50k 18 s (4.8 s).
+- Pivot row: only nonbasic, non-fixed entries are formed (active list), row-wise
+  when rho is sparse; candidate scan is branch-free.
+- Not done: Forrest-Tomlin, dual phase 1 with the subproblem approach,
+  parallelism inside an iteration (the pivot-row pass over A is threaded only for
+  large A). Per-iteration cost on large network problems is still about 1.7x HiGHS.
+- Netlib: 25/25 (19 optimal to 1e-7..1e-9, 6 infeasible detected); simplex times
+  within 0.9-1.9x of HiGHS' dual simplex on the larger models (25fv47 98 vs 104
+  ms, 80bau3b 89 vs 79, perold 60 vs 37, greenbea 190 vs 141); larger instances:
+  mcf10k 0.6-0.9 s (0.4 s), mcf50k 8-9 s (4.7 s), transport700 5.5 s (1.6 s;
+  the interior-point method is the right tool there: 1.0 s).
+
+**Presolve (extended).** `presolve/presolve.h` holds the problem as a dynamic
+sparse matrix and applies: empty / free / redundant rows, forcing rows, empty and
+fixed columns, dual fixing (dominated columns), singleton rows, doubleton
+equations, implied-free column singletons and few-entry implied-free columns
+aggregated out of equations (fill limited), free zero-cost singletons in
+inequalities, duplicate rows, and parallel columns (proportional entries AND
+costs, merged into one variable with summed bounds; postsolve splits the value,
+the duals are unchanged). Every operation records what its postsolve needs
+as it was when applied; postsolve restores x and y (z = c - A^T y on the
+original matrix) and is tested on 34 random LPs built to trigger each rule plus
+hand-built parallel-column cases.
+Aggregation limits (fill <= 64, columns with <= 12 entries) were tuned against HiGHS'
+reduced sizes AND nonzero counts: woodlands09 118k -> 46k rows (HiGHS 42k, 2.36M vs 2.38M
+nonzeros), brazil3 9636 -> 4696 rows (HiGHS 4496), greenbea 2392x5405 -> 1152x3202
+(HiGHS 951x2989), scrs8 -> 143x816 (HiGHS 120x783); looser limits beat HiGHS on row
+count but grew greenbea's nonzeros by 40%.
+Not done, and why: HiGHS' "dominated column" rule (192 columns on standata, where we
+remove 84 by merging parallel ones) needs implied dual bounds, and recovering correct
+duals after fixing such a column is the hard part; dependent-equation removal;
+coefficient tightening (MIP-only benefit).
+
+**Dual pricing: measured, no change.** Iteration counts of the dual simplex are
+already at parity with HiGHS' (within +15%, fewer on neos-5251015: 7.7k vs 14k, and
+25fv47: 2.0k vs 2.6k), so a different pricing rule cannot close the remaining gap.
+What is left is per-iteration cost: on mcf50k 111 us vs 52 us, of which 46% was
+refactorization overhead (LU 29%, primal/dual recomputation 15%). The refactor policy
+now uses a margin of 2.0 for bases with more than 10000 rows (noisy iteration times
+triggered early refactors): mcf50k 9.0 -> 7.5 s, neos-5251015 2.9 -> 2.6 s, small
+models unchanged.
 
 Done when (Stage 1):
 - IPM and dual simplex solve all of netlib to 1e-8 relative tolerance. (Dual simplex: 25/25; IPM: all feasible ones but greenbea.)

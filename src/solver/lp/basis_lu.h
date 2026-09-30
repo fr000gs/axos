@@ -23,7 +23,7 @@
 #include <cstring>
 #include <vector>
 
-namespace AXOS {
+namespace Panini {
 namespace Solver {
 
 // Sparse work vector: dense values plus the list of positions that may be
@@ -70,6 +70,14 @@ class BasisFactor {
     // of singular pivots; for each, singular_pos[i] is the basis position of the
     // dependent column and free_row[i] a row that was left without a pivot
     // (the caller substitutes the slack of that row).
+    //
+    // Right-looking Markowitz elimination on a dynamic sparse active matrix
+    // (columns hold values, rows hold patterns). Pivots minimize
+    // (row count - 1) (column count - 1) among entries that pass the threshold
+    // test |a| >= kThresh * (largest |a| in the column); the search examines
+    // columns and rows in order of increasing count and stops early (Markowitz
+    // / Suhl). Singletons cost 0, so triangular parts of the basis (slacks,
+    // network bases) are eliminated first and without fill.
     int
     factor(int m, const std::vector<Column> &cols, std::vector<int> &singular_pos,
         std::vector<int> &free_row)
@@ -84,158 +92,315 @@ class BasisFactor {
         singular_pos.clear();
         free_row.clear();
 
-        // row counts of the original matrix (sparsity tie-break)
-        std::vector<int> rowcnt(m, 0);
-        for (int k = 0; k < m; ++k)
-            for (int t = 0; t < cols[k].nnz; ++t) rowcnt[cols[k].idx[t]]++;
-        // column order: fewest nonzeros first
-        q_.resize(m);
-        for (int k = 0; k < m; ++k) q_[k] = k;
-        std::stable_sort(q_.begin(), q_.end(),
-            [&](int a, int b) { return cols[a].nnz < cols[b].nnz; });
+        constexpr double kThresh = 0.1, kTiny = 1e-11, kDrop = 1e-14;
+        constexpr int kSearch = 4; // candidate columns/rows examined per pivot
 
-        lp_.assign(1, 0); li_.clear(); lx_.clear();
-        up_.assign(1, 0); ui_.clear(); ux_.clear();
+        // ---- active matrix: pooled columns (values) and rows (patterns) ------
+        size_t nnz0 = 0;
+        for (int j = 0; j < m; ++j) nnz0 += cols[j].nnz;
+        const size_t cap0 = 2 * nnz0 + 4 * static_cast<size_t>(m) + 16;
+        cidx_.resize(cap0); cval_.resize(cap0); ridx_.resize(cap0);
+        cstart_.resize(m); clen_.resize(m); ccap_.resize(m);
+        rstart_.resize(m); rlen_.assign(m, 0); rcap_.resize(m);
+        size_t cend = 0, rend = 0;
+        for (int j = 0; j < m; ++j) {
+            cstart_[j] = cend;
+            clen_[j] = 0;
+            ccap_[j] = cols[j].nnz + 2;
+            for (int t = 0; t < cols[j].nnz; ++t) {
+                if (cols[j].val[t] == 0.0) continue;
+                cidx_[cend + clen_[j]] = cols[j].idx[t];
+                cval_[cend + clen_[j]] = cols[j].val[t];
+                ++clen_[j];
+                ++rlen_[cols[j].idx[t]];
+            }
+            cend += ccap_[j];
+        }
+        for (int i = 0; i < m; ++i) {
+            rstart_[i] = rend;
+            rcap_[i] = rlen_[i] + 2;
+            rend += rcap_[i];
+            rlen_[i] = 0;
+        }
+        for (int j = 0; j < m; ++j)
+            for (int t = 0; t < clen_[j]; ++t) {
+                const int i = cidx_[cstart_[j] + t];
+                ridx_[rstart_[i] + rlen_[i]++] = j;
+            }
+        // append with relocation to the end of the pool when full
+        auto col_push = [&](int j, int i, double v) {
+            if (clen_[j] == ccap_[j]) {
+                const size_t nc = 2 * static_cast<size_t>(ccap_[j]) + 4;
+                if (cend + nc > cidx_.size()) { cidx_.resize(2 * (cend + nc)); cval_.resize(2 * (cend + nc)); }
+                std::copy(cidx_.begin() + cstart_[j], cidx_.begin() + cstart_[j] + clen_[j], cidx_.begin() + cend);
+                std::copy(cval_.begin() + cstart_[j], cval_.begin() + cstart_[j] + clen_[j], cval_.begin() + cend);
+                cstart_[j] = cend;
+                ccap_[j] = static_cast<int>(nc);
+                cend += nc;
+            }
+            cidx_[cstart_[j] + clen_[j]] = i;
+            cval_[cstart_[j] + clen_[j]] = v;
+            ++clen_[j];
+        };
+        auto row_push = [&](int i, int j) {
+            if (rlen_[i] == rcap_[i]) {
+                const size_t nc = 2 * static_cast<size_t>(rcap_[i]) + 4;
+                if (rend + nc > ridx_.size()) ridx_.resize(2 * (rend + nc));
+                std::copy(ridx_.begin() + rstart_[i], ridx_.begin() + rstart_[i] + rlen_[i], ridx_.begin() + rend);
+                rstart_[i] = rend;
+                rcap_[i] = static_cast<int>(nc);
+                rend += nc;
+            }
+            ridx_[rstart_[i] + rlen_[i]++] = j;
+        };
+        auto row_remove = [&](int i, int j) { // remove column j from row i's pattern
+            int *r = ridx_.data() + rstart_[i];
+            for (int t = 0; t < rlen_[i]; ++t)
+                if (r[t] == j) { r[t] = r[--rlen_[i]]; return; }
+        };
+
+        // ---- count buckets (doubly linked lists) ------------------------------
+        chead_.assign(m + 1, -1); rhead_.assign(m + 1, -1);
+        cnext_.assign(m, -1); cprev_.assign(m, -1); rnext_.assign(m, -1); rprev_.assign(m, -1);
+        std::vector<char> cin(m, 0), rin(m, 0); // in a bucket (= active)
+        auto cins = [&](int j) {
+            const int c = clen_[j];
+            cnext_[j] = chead_[c]; cprev_[j] = -1;
+            if (chead_[c] >= 0) cprev_[chead_[c]] = j;
+            chead_[c] = j; cin[j] = 1;
+        };
+        auto cdel = [&](int j) {
+            if (!cin[j]) return;
+            const int c = clen_[j];
+            if (cprev_[j] >= 0) cnext_[cprev_[j]] = cnext_[j]; else chead_[c] = cnext_[j];
+            if (cnext_[j] >= 0) cprev_[cnext_[j]] = cprev_[j];
+            cin[j] = 0;
+        };
+        auto rins = [&](int i) {
+            const int c = rlen_[i];
+            rnext_[i] = rhead_[c]; rprev_[i] = -1;
+            if (rhead_[c] >= 0) rprev_[rhead_[c]] = i;
+            rhead_[c] = i; rin[i] = 1;
+        };
+        auto rdel = [&](int i) {
+            if (!rin[i]) return;
+            const int c = rlen_[i];
+            if (rprev_[i] >= 0) rnext_[rprev_[i]] = rnext_[i]; else rhead_[c] = rnext_[i];
+            if (rnext_[i] >= 0) rprev_[rnext_[i]] = rprev_[i];
+            rin[i] = 0;
+        };
+        std::vector<char> col_dead(m, 0); // singular columns
+        for (int j = 0; j < m; ++j) {
+            if (clen_[j] == 0) col_dead[j] = 1; else cins(j);
+        }
+        for (int i = 0; i < m; ++i)
+            if (rlen_[i] > 0) rins(i);
+
+        auto colmax = [&](int j) {
+            double mx = 0;
+            const double *v = cval_.data() + cstart_[j];
+            for (int t = 0; t < clen_[j]; ++t) mx = std::max(mx, std::abs(v[t]));
+            return mx;
+        };
+        auto find_in_col = [&](int j, int i) { // position of row i in column j
+            const int *ix = cidx_.data() + cstart_[j];
+            for (int t = 0; t < clen_[j]; ++t)
+                if (ix[t] == i) return t;
+            return -1;
+        };
+        // a column whose entries are all negligible is singular: drop it
+        auto kill_col = [&](int j) {
+            cdel(j);
+            for (int t = 0; t < clen_[j]; ++t) {
+                const int i = cidx_[cstart_[j] + t];
+                rdel(i);
+                row_remove(i, j);
+                if (rlen_[i] > 0) rins(i);
+            }
+            clen_[j] = 0;
+            col_dead[j] = 1;
+        };
+
+        // ---- outputs (triplets, converted at the end) ------------------------
+        q_.assign(m, -1);
+        prow_.assign(m, -1);
         udiag_.assign(m, 1.0);
-        prow_.assign(m, -1);       // prow[k] = row pivoted at step k
-        std::vector<int> pinv(m, -1); // pinv[row] = step, -1 if not pivoted
-        std::vector<double> x(m, 0.0);
-        std::vector<int> xi;       // nonzero pattern in topological order
-        std::vector<int> stack, pstack, mark(m, -1);
-        std::vector<int> lcol_row;  // L entries use ORIGINAL row ids until the end
-        int nsing = 0;
-        std::vector<int> failed_steps;
-        // L columns are stored by step; entries below the pivot in original rows
-        std::vector<int> lstart{0};
-        std::vector<int> l_orig_idx;
-        std::vector<double> l_val;
+        std::vector<int> pinv(m, -1), cstep(m, -1);
+        std::vector<int> lrow, lstep;   // L entries: (original row, step)
+        std::vector<double> lval;
+        std::vector<int> urowstep, ucol; // U entries: (step of the pivot row, basis column)
+        std::vector<double> uval;
+        std::vector<int> wpos(m, -1);    // row -> position in the scattered column
+        std::vector<int> inl(m, -1);     // row is in the current L column (stamp k)
+        std::vector<int> lcol_i;
+        std::vector<double> lcol_v;
+        std::vector<int> urow_j;
+        std::vector<double> urow_v;
 
-        for (int k = 0; k < m; ++k) {
-            const Column &c = cols[q_[k]];
-            // ---- reach of the column pattern in the graph of L ----------
-            xi.clear();
-            for (int t = 0; t < c.nnz; ++t) {
-                int i = c.idx[t];
-                if (mark[i] == k) continue;
-                // iterative DFS from row i
-                stack.assign(1, i);
-                pstack.assign(1, 0);
-                mark[i] = k;
-                while (!stack.empty()) {
-                    int r = stack.back();
-                    int step = pinv[r];
-                    int &pp = pstack.back();
-                    bool pushed = false;
-                    if (step >= 0) {
-                        int beg = lstart[step], end = lstart[step + 1];
-                        for (; beg + pp < end;) {
-                            int ch = l_orig_idx[beg + pp];
-                            ++pp;
-                            if (mark[ch] != k) {
-                                mark[ch] = k;
-                                stack.push_back(ch);
-                                pstack.push_back(0);
-                                pushed = true;
-                                break;
-                            }
+        int k = 0;
+        while (k < m) {
+            // ---- pivot search ------------------------------------------------
+            int pr = -1, pc = -1;
+            double best = 1e300, pv = 0;
+            int searched = 0;
+            for (int cnt = 1; cnt <= m; ++cnt) {
+                for (int j = chead_[cnt]; j >= 0;) {
+                    const int jn = cnext_[j];
+                    const double mx = colmax(j);
+                    if (mx < kTiny) { kill_col(j); j = jn; continue; }
+                    const int *ix = cidx_.data() + cstart_[j];
+                    const double *v = cval_.data() + cstart_[j];
+                    for (int t = 0; t < clen_[j]; ++t) {
+                        if (std::abs(v[t]) < kThresh * mx) continue;
+                        const double cost = static_cast<double>(rlen_[ix[t]] - 1) * (cnt - 1);
+                        if (cost < best || (cost == best && std::abs(v[t]) > std::abs(pv))) {
+                            best = cost; pr = ix[t]; pc = j; pv = v[t];
                         }
                     }
-                    if (!pushed) {
-                        xi.push_back(r);
-                        stack.pop_back();
-                        pstack.pop_back();
+                    if (++searched >= kSearch && pc >= 0) break;
+                    j = jn;
+                }
+                if (pc >= 0 && (best <= static_cast<double>(cnt - 1) * (cnt - 1) || searched >= kSearch)) break;
+                for (int i = rhead_[cnt]; i >= 0; i = rnext_[i]) {
+                    const int *rj = ridx_.data() + rstart_[i];
+                    for (int t = 0; t < rlen_[i]; ++t) {
+                        const int j = rj[t];
+                        const int pos = find_in_col(j, i);
+                        if (pos < 0) continue;
+                        const double a = cval_[cstart_[j] + pos];
+                        const double cost = static_cast<double>(cnt - 1) * (clen_[j] - 1);
+                        if (cost >= best) continue;
+                        if (std::abs(a) < kThresh * colmax(j) || std::abs(a) < kTiny) continue;
+                        best = cost; pr = i; pc = j; pv = a;
+                    }
+                    if (++searched >= kSearch && pc >= 0) break;
+                }
+                if (pc >= 0 && (best <= static_cast<double>(cnt) * cnt || searched >= kSearch)) break;
+            }
+            if (pc < 0) break; // the remaining columns are singular
+
+            // ---- eliminate (pr, pc) -------------------------------------------
+            q_[k] = pc; prow_[k] = pr; udiag_[k] = pv;
+            pinv[pr] = k; cstep[pc] = k;
+            cdel(pc);
+            rdel(pr);
+            // L column: the other rows of column pc
+            lcol_i.clear(); lcol_v.clear();
+            for (int t = 0; t < clen_[pc]; ++t) {
+                const int i = cidx_[cstart_[pc] + t];
+                if (i == pr) continue;
+                const double l = cval_[cstart_[pc] + t] / pv;
+                lcol_i.push_back(i); lcol_v.push_back(l);
+                lrow.push_back(i); lstep.push_back(k); lval.push_back(l);
+            }
+            // rows of column pc lose it
+            for (int i : lcol_i) { rdel(i); row_remove(i, pc); inl[i] = k; }
+            clen_[pc] = 0;
+            // U row: the other columns of row pr (their entry in row pr is removed)
+            urow_j.clear(); urow_v.clear();
+            {
+                const int *rj = ridx_.data() + rstart_[pr];
+                for (int t = 0; t < rlen_[pr]; ++t) {
+                    const int j = rj[t];
+                    if (j == pc) continue;
+                    const int pos = find_in_col(j, pr);
+                    if (pos < 0) continue;
+                    const double a = cval_[cstart_[j] + pos];
+                    cidx_[cstart_[j] + pos] = cidx_[cstart_[j] + clen_[j] - 1];
+                    cval_[cstart_[j] + pos] = cval_[cstart_[j] + clen_[j] - 1];
+                    cdel(j);
+                    --clen_[j];
+                    urow_j.push_back(j); urow_v.push_back(a);
+                    urowstep.push_back(k); ucol.push_back(j); uval.push_back(a);
+                }
+                rlen_[pr] = 0;
+            }
+            // Schur update: column j -= a_{pr,j} * lcol
+            if (!lcol_i.empty()) {
+                for (size_t u = 0; u < urow_j.size(); ++u) {
+                    const int j = urow_j[u];
+                    const double a = urow_v[u];
+                    for (int t = 0; t < clen_[j]; ++t) wpos[cidx_[cstart_[j] + t]] = t;
+                    for (size_t l = 0; l < lcol_i.size(); ++l) {
+                        const int i = lcol_i[l];
+                        const double d = -lcol_v[l] * a;
+                        if (wpos[i] >= 0) {
+                            cval_[cstart_[j] + wpos[i]] += d;
+                        } else { // fill-in
+                            col_push(j, i, d);
+                            wpos[i] = clen_[j] - 1;
+                            row_push(i, j);
+                        }
+                    }
+                    // clear the map and drop updated entries that cancelled (only
+                    // rows of the L column: they are out of their buckets)
+                    for (int t = 0; t < clen_[j];) {
+                        const int i = cidx_[cstart_[j] + t];
+                        wpos[i] = -1;
+                        if (inl[i] == k && std::abs(cval_[cstart_[j] + t]) < kDrop) {
+                            row_remove(i, j);
+                            cidx_[cstart_[j] + t] = cidx_[cstart_[j] + clen_[j] - 1];
+                            cval_[cstart_[j] + t] = cval_[cstart_[j] + clen_[j] - 1];
+                            --clen_[j];
+                            continue;
+                        }
+                        ++t;
                     }
                 }
             }
-            // xi is in reverse topological order (finish order): process reversed
-            for (int t = 0; t < c.nnz; ++t) x[c.idx[t]] = c.val[t];
-            for (int t = static_cast<int>(xi.size()) - 1; t >= 0; --t) {
-                int r = xi[t];
-                int step = pinv[r];
-                if (step < 0) continue;
-                double xr = x[r];
-                if (xr == 0.0) continue;
-                for (int p = lstart[step]; p < lstart[step + 1]; ++p)
-                    x[l_orig_idx[p]] -= l_val[p] * xr;
+            // back into the buckets with their new counts
+            for (int j : urow_j) {
+                if (clen_[j] == 0) col_dead[j] = 1; else cins(j);
             }
-            // ---- pivot selection among unpivoted rows ---------------------
-            double amax = 0;
-            for (int r : xi)
-                if (pinv[r] < 0) amax = std::max(amax, std::abs(x[r]));
-            int piv = -1;
-            if (amax > 1e-11) {
-                const double thresh = 0.1 * amax;
-                int best_cnt = 1 << 30;
-                double best_abs = 0;
-                for (int r : xi) {
-                    if (pinv[r] >= 0) continue;
-                    double a = std::abs(x[r]);
-                    if (a < thresh) continue;
-                    if (rowcnt[r] < best_cnt || (rowcnt[r] == best_cnt && a > best_abs)) {
-                        best_cnt = rowcnt[r];
-                        best_abs = a;
-                        piv = r;
-                    }
-                }
-            }
-            if (piv < 0) { // singular column
-                ++nsing;
-                failed_steps.push_back(k);
-                singular_pos.push_back(q_[k]);
-                for (int r : xi) x[r] = 0.0;
-                for (int t = 0; t < c.nnz; ++t) x[c.idx[t]] = 0.0;
-                // record an empty step; pinv stays -1 (row remains free)
-                lstart.push_back(static_cast<int>(l_orig_idx.size()));
-                up_.push_back(static_cast<int>(ui_.size()));
-                prow_[k] = -1;
-                udiag_[k] = 1.0;
-                continue;
-            }
-            const double pv = x[piv];
-            udiag_[k] = pv;
-            pinv[piv] = k;
-            prow_[k] = piv;
-            // U column: entries at already pivoted rows (steps < k)
-            for (int r : xi) {
-                if (r == piv) { x[r] = 0.0; continue; }
-                if (pinv[r] >= 0 && pinv[r] < k) {
-                    if (x[r] != 0.0) {
-                        ui_.push_back(pinv[r]);
-                        ux_.push_back(x[r]);
-                    }
-                } else if (x[r] != 0.0) { // below the pivot: L entry
-                    l_orig_idx.push_back(r);
-                    l_val.push_back(x[r] / pv);
-                }
-                x[r] = 0.0;
-            }
-            for (int t = 0; t < c.nnz; ++t) x[c.idx[t]] = 0.0;
-            up_.push_back(static_cast<int>(ui_.size()));
-            lstart.push_back(static_cast<int>(l_orig_idx.size()));
+            for (int i : lcol_i)
+                if (rlen_[i] > 0) rins(i);
+            ++k;
         }
-        // ---- repair: pair every singular column with an unpivoted row -----
+        const int nsing = m - k;
+
+        // ---- singular columns: remaining steps without a pivot row ----------
+        for (int j = 0; j < m; ++j)
+            if (cstep[j] < 0) {
+                singular_pos.push_back(j);
+                q_[k] = j; cstep[j] = k; prow_[k] = -1; udiag_[k] = 1.0;
+                ++k;
+            }
+        for (int r = 0; r < m && free_row.size() < singular_pos.size(); ++r)
+            if (pinv[r] < 0) free_row.push_back(r);
+
+        // ---- L by step (entries in unpivoted rows only occur when singular) --
+        lp_.assign(m + 1, 0);
+        for (size_t t = 0; t < lrow.size(); ++t)
+            if (pinv[lrow[t]] >= 0) ++lp_[lstep[t] + 1];
+        for (int s0 = 0; s0 < m; ++s0) lp_[s0 + 1] += lp_[s0];
+        li_.resize(lp_[m]); lx_.resize(lp_[m]);
         {
-            std::vector<int> unp;
-            for (int r = 0; r < m; ++r)
-                if (pinv[r] < 0) unp.push_back(r);
-            for (size_t t = 0; t < unp.size() && t < failed_steps.size(); ++t) {
-                free_row.push_back(unp[t]);
+            std::vector<int> nx(lp_.begin(), lp_.end() - 1);
+            for (size_t t = 0; t < lrow.size(); ++t) {
+                const int st = pinv[lrow[t]];
+                if (st < 0) continue;
+                const int q = nx[lstep[t]]++;
+                li_[q] = st;
+                lx_[q] = lval[t];
             }
         }
-        // ---- convert L row ids to pivot steps ---------------------------------
-        lp_ = lstart;
-        li_.resize(l_orig_idx.size());
-        for (size_t p = 0; p < l_orig_idx.size(); ++p) li_[p] = pinv[l_orig_idx[p]];
-        lx_ = l_val;
-        // entries whose row is still unpivoted (only when singular) are dropped
-        if (nsing > 0) {
-            for (size_t p = 0; p < li_.size(); ++p)
-                if (li_[p] < 0) lx_[p] = 0.0, li_[p] = 0;
+        // ---- U by step of the column: entries at earlier steps -------------
+        up_.assign(m + 1, 0);
+        for (size_t t = 0; t < ucol.size(); ++t) ++up_[cstep[ucol[t]] + 1];
+        for (int s0 = 0; s0 < m; ++s0) up_[s0 + 1] += up_[s0];
+        ui_.resize(up_[m]); ux_.resize(up_[m]);
+        {
+            std::vector<int> nx(up_.begin(), up_.end() - 1);
+            for (size_t t = 0; t < ucol.size(); ++t) {
+                const int q = nx[cstep[ucol[t]]]++;
+                ui_[q] = urowstep[t];
+                ux_[q] = uval[t];
+            }
         }
         singular_ = nsing;
         pinv_ = pinv;
         qinv_.assign(m, 0);
-        for (int k = 0; k < m; ++k) qinv_[q_[k]] = k;
+        for (int s0 = 0; s0 < m; ++s0) qinv_[q_[s0]] = s0;
         mark_.assign(m, 0);
         stamp_ = 0;
         w_.assign(m, 0.0);
@@ -462,6 +627,7 @@ class BasisFactor {
     }
 
     int updates() const { return n_updates_; }
+    size_t lu_nnz() const { return li_.size() + ui_.size() + m_; }
     // true when the eta file has grown larger than the factors it extends
     bool eta_heavy(double factor) const { return eta_idx_.size() > factor * (li_.size() + ui_.size() + m_); }
     size_t nnz() const { return li_.size() + ui_.size() + eta_idx_.size() + m_; }
@@ -556,9 +722,14 @@ class BasisFactor {
     std::vector<double> eta_val_, eta_diag_;
     mutable std::vector<double> w_;
     std::vector<int> pinv_, qinv_;
+    // factor() workspace, kept between refactorizations
+    std::vector<int> cidx_, ridx_, clen_, ccap_, rlen_, rcap_;
+    std::vector<size_t> cstart_, rstart_;
+    std::vector<double> cval_;
+    std::vector<int> chead_, rhead_, cnext_, cprev_, rnext_, rprev_;
     mutable std::vector<int> mark_, starts_, order_, order2_, stk_, pst_;
     mutable int stamp_ = 0;
 };
 
 } // namespace Solver
-} // namespace AXOS
+} // namespace Panini

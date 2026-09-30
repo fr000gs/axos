@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <new>
 #include <mutex>
 #include <memory>
@@ -27,7 +28,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace AXOS {
+namespace Panini {
 namespace Sparse {
 
 template <typename T, typename Idx> class MultifrontalLdl {
@@ -230,7 +231,7 @@ template <typename T, typename Idx> class MultifrontalLdl {
     // remaining top of the tree is processed in order with the dense updates
     // and the assembly loops parallelized inside each large front.
     bool
-    factorize(const T *values, Kind kind, const signed char *signs, T eps)
+    factorize(const T *values, Kind kind, const signed char *signs, T eps, T repl = T(0))
     {
         if (!analyzed_) throw std::runtime_error("MultifrontalLdl: not analyzed");
         const size_t S = sn_start_.size() - 1;
@@ -320,7 +321,7 @@ template <typename T, typename Idx> class MultifrontalLdl {
             }
             int fail = -1;
             nreg += dense::partial_ldlt<T>(fs, ns, F, fs, d_.data() + f, fsign, eps,
-                check, &fail, bf.work.data(), par);
+                check, &fail, bf.work.data(), par, repl);
             bf.prof.dense += ms(t0);
             t0 = clock::now();
             if (fail >= 0) {
@@ -371,7 +372,8 @@ template <typename T, typename Idx> class MultifrontalLdl {
                 Buffers bf = make_buffers(task_max_front_);
 #pragma omp for schedule(dynamic, 1) nowait
                 for (long ti = 0; ti < static_cast<long>(tasks_.size()); ++ti) {
-                    if (fail_col.load() >= 0) continue;
+                    if (fail_col.load() != -1) continue;
+                    if (cancel_ && cancel_()) { long e = -1; fail_col.compare_exchange_strong(e, -2); continue; }
                     const Idx root = tasks_[ti];
                     for (Idx s = first_desc_[root]; s <= root; ++s)
                         if (!process(static_cast<size_t>(s), bf, false)) break;
@@ -384,15 +386,17 @@ template <typename T, typename Idx> class MultifrontalLdl {
         prof_.ntop = top_nodes_.size();
         wall0 = std::chrono::steady_clock::now();
         // ---- serial phase: the top of the tree ---------------------------
-        if (fail_col.load() < 0) {
+        if (fail_col.load() == -1) {
             Buffers bf = make_buffers(max_front_top_);
-            for (Idx s : top_nodes_)
+            for (Idx s : top_nodes_) {
+                if (cancel_ && cancel_()) { fail_col.store(-2); break; }
                 if (!process(static_cast<size_t>(s), bf, true)) break;
+            }
             add_prof(bf.prof);
         }
         prof_.wall_top = wall_ms();
         n_reg_ = nreg.load();
-        if (fail_col.load() >= 0) {
+        if (fail_col.load() != -1) {
             failed_ = fail_col.load();
             return false;
         }
@@ -444,6 +448,7 @@ template <typename T, typename Idx> class MultifrontalLdl {
         for (size_t k = 0; k < n_; ++k) x[perm_[k]] = y[k];
     }
 
+    void set_cancel(std::function<bool()> f) { cancel_ = std::move(f); }
     size_t factor_nnz() const { return factor_nnz_; }
     size_t stored_entries() const { return lvals_.size(); }
     size_t supernodes() const { return sn_start_.empty() ? 0 : sn_start_.size() - 1; }
@@ -504,6 +509,7 @@ template <typename T, typename Idx> class MultifrontalLdl {
         }
     };
     Pool pool_;
+    std::function<bool()> cancel_;
     // Splits the assembly tree into independent subtrees (processed in
     // parallel) and the remaining top nodes (processed serially). A subtree
     // is a task when its estimated work is a small fraction of the total.
@@ -641,4 +647,4 @@ template <typename T, typename Idx> class MultifrontalLdl {
 };
 
 } // namespace Sparse
-} // namespace AXOS
+} // namespace Panini

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //
-// Optimization problem model shared by all AXOS solvers.
+// Optimization problem model shared by all Panini solvers.
 //
 //   minimize    c^T x + offset
 //   subject to  row_lb <= A x <= row_ub
@@ -19,6 +19,8 @@
 //                           + sum_j (z_j > 0 ? col_lb_j : col_ub_j) * z_j
 #pragma once
 
+#include <atomic>
+
 #include "sparse/csr.h"
 #include <cmath>
 #include <limits>
@@ -26,7 +28,7 @@
 #include <string>
 #include <vector>
 
-namespace AXOS {
+namespace Panini {
 namespace Solver {
 
 inline constexpr double kInf = std::numeric_limits<double>::infinity();
@@ -39,6 +41,7 @@ enum class Status {
     IterationLimit,
     TimeLimit,
     NumericalError,
+    Interrupted,     // stopped through SolverOptions::interrupt
 };
 
 inline const char *
@@ -52,6 +55,7 @@ to_string(Status s)
     case Status::IterationLimit: return "iteration limit";
     case Status::TimeLimit: return "time limit";
     case Status::NumericalError: return "numerical error";
+    case Status::Interrupted: return "interrupted";
     }
     return "?";
 }
@@ -138,6 +142,10 @@ struct LpSolution {
     long iterations = 0;
     double seconds = 0;
     double factor_flops = 0; // Ipm (CPU): estimated flops of one KKT factorization, when known
+    // false when the optimum is certified only in the presolved space: the primal point
+    // satisfies the tolerances on the original problem, but the duals recovered by
+    // postsolve do not (badly conditioned reduction chains amplify their errors)
+    bool duals_verified = true;
 };
 
 // Which algorithm solve_lp() uses. Pdlp is cheap per iteration (best on the GPU
@@ -151,6 +159,20 @@ enum class LpMethod { Pdlp, Ipm, Simplex, Auto };
 //   ||primal residual||_2 <= eps_primal * (1 + ||finite row bounds||_2)
 //   ||dual residual||_2   <= eps_dual   * (1 + ||c||_2)
 //   |primal obj - dual obj| <= eps_gap * (1 + |primal obj| + |dual obj|)
+// Cooperative stop signal. A solver polls it once per iteration (per
+// termination check for PDLP) and returns Status::Interrupted. Flags can be
+// chained: a child flag also reports the parent's.
+struct StopFlag {
+    std::atomic<bool> flag{false};
+    const StopFlag *parent = nullptr;
+    void set() { flag.store(true, std::memory_order_relaxed); }
+    bool
+    get() const
+    {
+        return flag.load(std::memory_order_relaxed) || (parent && parent->get());
+    }
+};
+
 struct SolverOptions {
     LpMethod method = LpMethod::Pdlp;
     int ipm_max_iterations = 200;
@@ -171,6 +193,17 @@ struct SolverOptions {
     int ruiz_iterations = 10;
     double pock_chambolle_alpha = 1.0; // <0 disables
     int check_frequency = 64;          // iterations between termination checks
+    // Auto: run the dual simplex (CPU thread) concurrently with the interior-point
+    // method / PDLP (on the storage's device) and keep the first accepted result.
+    // false: the sequential strategy (deterministic).
+    bool concurrent = true;
+    // Auto (device thread, problems with 50000+ nonzeros): start with a short PDLP slice
+    // before the interior-point method. Big wins where PDLP is the fast method (qap15,
+    // savsched1, ex10), 5-20 s lost where the interior-point method wins.
+    int pdlp_first = -1; // -1 auto (on for CUDA, off for CPU), 0 off, 1 on
+    const StopFlag *interrupt = nullptr; // optional external stop request
+
+    bool interrupted() const { return interrupt && interrupt->get(); }
 
     void
     set_tolerance(double eps)
@@ -237,4 +270,4 @@ evaluate_solution(const LpProblem &p, const std::vector<double> &x,
 }
 
 } // namespace Solver
-} // namespace AXOS
+} // namespace Panini

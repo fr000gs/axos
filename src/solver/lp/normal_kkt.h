@@ -18,9 +18,10 @@
 #include "tensorET.h"
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
-namespace AXOS {
+namespace Panini {
 namespace Solver {
 
 class NormalKkt {
@@ -81,6 +82,7 @@ class NormalKkt {
                 if (static_cast<size_t>(ci[p]) == i) diag_[i] = p;
         S_ = Mat(m_, m_, rp, ci, std::vector<double>(ci.size(), 0.0));
         dinv_.assign(n_, 0.0);
+        ones_.assign(m_, 1);
         y_ = Vec(m_);
         rhs_ = Vec(m_);
         ok_ = true;
@@ -94,8 +96,14 @@ class NormalKkt {
         analyzed_ = true;
     }
     double factor_flops() const { return ldl_.factor_flops(); }
+    // symbolic estimate without a full analysis (see Sparse::symbolic_ldl_flops)
+    double estimate_flops(double cap, const std::function<bool()> &cancel = nullptr) const
+    {
+        return Sparse::symbolic_ldl_flops<int32_t>(m_, srp_.data(), sci_.data(), cap, cancel);
+    }
     size_t factor_nnz() const { return ldl_.factor_nnz(); }
     void print_profile() const { ldl_.print_profile(); }
+    void set_cancel(std::function<bool()> f) { ldl_.set_cancel(std::move(f)); }
 
     // hz: Theta_x^{-1} for the n columns; thw: Theta_w for the m rows.
     bool factorize(const double *hz, const double *thw, double rho, double delta)
@@ -123,6 +131,12 @@ class NormalKkt {
                 sv[diag_[i]] += thw[i] + delta;
             }
         }
+        // A pivot that is negligible next to the largest diagonal of S comes from a
+        // dependent row of A (equations with Theta_w = 0): drop that row from the
+        // solve instead of dividing by round-off.
+        double dmax = 0;
+        for (size_t i = 0; i < m_; ++i) dmax = std::max(dmax, sv[diag_[i]]);
+        ldl_.set_pivot_regularization(ones_, 1e-14 * dmax, 1e128);
         return ldl_.factorize(S_);
     }
 
@@ -158,10 +172,11 @@ class NormalKkt {
     Mat S_;
     std::vector<int32_t> srp_, sci_, diag_;
     std::vector<double> dinv_;
+    std::vector<signed char> ones_;
     Vec y_, rhs_;
     size_t m_ = 0, n_ = 0;
     bool ok_ = false, analyzed_ = false, par_ = false;
 };
 
 } // namespace Solver
-} // namespace AXOS
+} // namespace Panini

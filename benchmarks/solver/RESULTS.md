@@ -1,6 +1,6 @@
 # LP solver benchmark results
 
-AXOS's LP solvers (`solve_lp`: presolve + scaling on) against HiGHS on
+Panini's LP solvers (`solve_lp`: presolve + scaling on) against HiGHS on
 (1) generated structured LPs and (2) real netlib models. Machine: 16
 hardware threads, RTX 4060 Laptop GPU, on AC power, double precision. HiGHS
 is the version bundled with SciPy 1.18.1 (generated instances, run through
@@ -236,3 +236,119 @@ PDLP to 1e-4, then a primal feasibility solve (objective dropped) and a dual fea
 solve (b and bounds zeroed), each from the current point. Mixed results at a 1e-6
 to 1e-8 target: 80bau3b 5.5 s -> 2.5 s, shell 117 -> 80 ms, but qap15 0.56 -> 1.2 s,
 stair 0.37 -> 1.3 s, e226 and 25fv47 slower; perold and greenbea still hit the limit.
+
+## Mittelmann subset, second run (concurrent Auto, 120 s limit, eps 1e-6)
+
+After: concurrent Auto (simplex thread + IPM/PDLP thread), Markowitz basis LU, active-set
+pivot row, time-adaptive refactorization, AMD supervariables, the extended presolve and the
+faster dense kernel. Seconds; the earlier sequential run (300 s limit) is in the first table.
+
+```
+instance               CPU       CUDA          instance               CPU       CUDA
+brazil3                0.4        0.8          physiciansched3-3     51.0       24.9
+chromaticindex1024-7   1.8        2.2          qap15                 12.5        3.8
+datt256_lp            20.0        5.6          rmine15               93.8   limit
+ex10                   1.7       41.5          s100               limit      limit
+graph40-40             9.5        6.5          s250r10               81.4       16.5
+irish-electricity      ~19  (note)               savsched1            53.1       31.8
+neos-5052403-cygnet   36.3       12.4          supportcase10         37.8       17.8
+neos-5251015          12.4        6.7          woodlands09           22.7       14.1
+```
+
+15 of 16 solve on the CPU and 14 of 16 on CUDA (first run: 12 of 16 with 300 s).
+Objectives agree with the first run to 1e-6 or better where both solved.
+
+ex10 is an outlier: 1.7 s on the CPU but 41.5 s on CUDA. Not yet investigated. A likely
+cause (unverified): the simplex thread finishes early on CUDA too, but `solve_lp` joins the
+device thread, and a cuDSS analysis/factorization cannot be interrupted (only the CPU
+factorization polls the stop flag), so the run waits for it.
+
+Note on irish-electricity (8.3 s CPU / 7.2 s CUDA before the verification below existed,
+about 19 s on the CPU with it): this instance has a chain of about 45 constraints that doubles a tiny slack at each
+step. The full presolve fixes the chain exactly (forcing rows) and the reduced problem
+solves to 2.54626e6, which HiGHS' simplex confirms on the original problem
+(2.54625456e6, 100 s) and HiGHS' IPM certifies on our reduced problem. Without those
+reductions an interior-point run converges to 2.4544e6, a point feasible only to 3e-4 that
+the chain turns into a 3.7% lower objective: an ill-conditioning artifact, not a better
+optimum. The postsolved duals of the full presolve are garbage (residual 38; interior-point
+round-off amplified by the chain), so `solve_lp` now (1) verifies the tolerances on the
+ORIGINAL problem after postsolve, (2) on failure retries with the conservative reductions
+for at most max(10 s, time used), and (3) if that does not verify either, returns the first
+result with `LpSolution::duals_verified = false` (status stays Optimal when the primal point
+passes; if even the primal fails the status is NumericalError). My first version of the
+check retried without a time bound and discarded the correct result; the bound and the flag
+are the fix.
+
+## Mittelmann subset, third run (PDLP slice first on the device thread)
+
+Seconds, previous run -> this run (`*` = time limit, 120 s). Changes: the device thread of
+concurrent Auto starts with a PDLP slice (2-8 s) on problems with 50000+ nonzeros and before an
+expensive interior-point factorization; PDLP ray tolerance tied to the requested accuracy.
+
+```
+brazil3                CPU     0.4 ->     0.2   CUDA     0.8 ->     0.4
+chromaticindex1024-7   CPU     1.8 ->     0.2   CUDA     2.2 ->     0.4
+datt256_lp             CPU    20.0 ->     1.3   CUDA     5.6 ->     0.7
+ex10                   CPU     1.7 ->     0.7   CUDA    41.5 ->     0.6
+graph40-40             CPU     9.5 ->     1.5   CUDA     6.5 ->     0.8
+irish-electricity      CPU     8.3 ->    29.0   CUDA     7.2 ->    26.5
+neos-5052403-cygnet    CPU    36.3 ->    26.2   CUDA    12.4 ->    18.2
+neos-5251015           CPU    12.4 ->     8.7   CUDA     6.7 ->     1.8
+physiciansched3-3      CPU    51.0 ->    65.3   CUDA    24.9 ->    32.8
+qap15                  CPU    12.5 ->     0.7   CUDA     3.8 ->     0.4
+rmine15                CPU    93.8 ->  120.3*   CUDA  122.6* ->  122.0*
+s100                   CPU  121.3* ->  120.7*   CUDA  120.1* ->  120.1*
+s250r10                CPU    81.4 ->    79.4   CUDA    16.5 ->    21.8
+savsched1              CPU    53.1 ->     4.0   CUDA    31.8 ->     1.1
+supportcase10          CPU    37.8 ->    48.6   CUDA    17.8 ->    26.7
+woodlands09            CPU    22.7 ->    16.8   CUDA    14.1 ->     2.9
+```
+
+14 of 16 solve on both backends (CPU: rmine15 slipped from 94 s to the limit; CUDA: unchanged).
+Gains are large where PDLP is the fast method (qap15 12.5 -> 0.7 s, savsched1 53 -> 4 s and 32 -> 1.1 s,
+ex10 CUDA 41.5 -> 0.6 s, datt256_lp 20 -> 1.3 s, graph40-40 9.5 -> 1.5 s). Where the interior-point
+method is the winner the PDLP slice is pure overhead: physiciansched3-3 +14 s / +8 s, irish-electricity
++21 s (PDLP slice plus the postsolve-verification retry described above), neos-5052403-cygnet CUDA
++6 s, s250r10 CUDA +5 s, rmine15 CPU past the limit. supportcase10 on CUDA varies between runs (4.5 s
+in an isolated run, 26.7 s here), which I have not explained. A better policy would run PDLP and the
+interior-point method concurrently on the device instead of in slices; not done.
+
+## Mittelmann subset, fourth run (defaults: PDLP-first slice on for CUDA, off for CPU)
+
+Seconds, third run -> this run (`*` = 120 s limit). Changes since the third run: `pdlp_first` is
+now automatic (CUDA on, CPU off), looser presolve aggregation (fill <= 64, <= 12 entries),
+parallel-column merging, refactor margin 2.0 for bases over 10000 rows.
+
+```
+instance               CPU                    CUDA
+brazil3                0.2 ->   0.3           0.4 ->   0.5
+chromaticindex1024-7   0.2 ->   2.0           0.4 ->   0.4
+datt256_lp             1.3 ->   3.7           0.7 ->   0.8
+ex10                   0.7 ->   1.6           0.6 ->   0.6
+graph40-40             1.5 ->   8.7           0.8 ->   0.9
+irish-electricity     29.0 ->  17.5          26.5 ->  26.5
+neos-5052403-cygnet   26.2 ->  17.9          18.2 ->  18.5
+neos-5251015           8.7 ->   3.1           1.8 ->   1.8
+physiciansched3-3     65.3 ->  50.7          32.8 ->  31.4
+qap15                  0.7 ->  11.3           0.4 ->   0.6
+rmine15             120.3* ->  90.0         122.0* -> 121.2*
+s100                120.7* -> 120.3*        120.1* -> 120.0*
+s250r10               79.4 ->  71.8          21.8 ->  21.9
+savsched1              4.0 ->  22.9           1.1 ->   1.5
+supportcase10         48.6 ->  38.3          26.7 ->   4.7
+woodlands09           16.8 ->  20.3           2.9 ->   3.7
+```
+
+15 of 16 solve on the CPU (rmine15 is back under the limit: 90 s) and 14 of 16 on CUDA.
+
+CUDA is unchanged, as intended (the slice stays on there); supportcase10's 26.7 -> 4.7 s is run-to-run
+variation, not a change I can attribute (it was 4.5 s in an isolated run earlier, 26.7 s in the third table).
+
+On the CPU the slice is off now, so the instances it helped got slower: qap15 0.7 -> 11.3 s,
+savsched1 4.0 -> 22.9 s, graph40-40 1.5 -> 8.7 s, datt256_lp 1.3 -> 3.7 s, chromaticindex1024-7 0.2 -> 2.0 s,
+ex10 0.7 -> 1.6 s. The instances where the interior-point method wins got faster: irish-electricity
+29 -> 17.5 s, neos-5052403-cygnet 26 -> 18 s, neos-5251015 8.7 -> 3.1 s, physiciansched3-3 65 -> 51 s,
+supportcase10 49 -> 38 s, rmine15 timeout -> 90 s (presolve and slice effects are not separated).
+Net on the CPU: 6 instances got faster and 7 slower; the total over the 16 is lower (about 80 s
+gained against 45 s lost, rmine15 counted as 30 s), but it is close, and the slice is what makes
+qap15 and savsched1 fast. `--pdlp-first` forces it on.

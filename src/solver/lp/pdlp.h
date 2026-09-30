@@ -30,7 +30,7 @@
 #include <chrono>
 #include <cstdio>
 
-namespace AXOS {
+namespace Panini {
 namespace Solver {
 
 template <template <typename> class Store = Cpu::HostStorage> class Pdlp {
@@ -46,36 +46,47 @@ template <template <typename> class Store = Cpu::HostStorage> class Pdlp {
 
   public:
     // Optional starting point (original scale) and termination mode for the
-    // polishing sub-solves: 0 full KKT, 1 primal residual only, 2 dual residual only.
+    // polishing: 0 full KKT, 1 primal residual only, 2 dual residual only, 3 objective gap
+    // at the tolerance with both residuals merely small (the point polishing starts from).
     struct Start {
         const std::vector<double> *x = nullptr, *y = nullptr;
         int mode = 0;
     };
 
     // Solves p (no presolve). Requires at least one row and one column. With
-    // opt.pdlp_polish and a tight tolerance, PDLP runs to a looser tolerance
-    // first and then polishes: a feasibility solve for x (objective dropped)
-    // and one for y (right-hand sides and bounds zeroed) from that point, which
-    // converge much faster than continuing on the full problem.
+    // opt.pdlp_polish (feasibility polishing, after cuPDLPx) PDLP first runs until
+    // the objective gap meets the tolerance while the residuals are still loose,
+    // then polishes: a feasibility solve for x (objective dropped) and one for y
+    // (right-hand sides and bounds zeroed), each started from that point. These
+    // converge much faster than continuing on the full problem, because PDLP
+    // typically closes the gap long before the residuals.
     LpSolution
     solve(const LpProblem &p, const SolverOptions &opt)
     {
-        const double tight = std::min({opt.eps_primal, opt.eps_dual, opt.eps_gap});
-        if (!opt.pdlp_polish || tight >= 5e-6) return solve_core(p, opt, nullptr);
+        if (!opt.pdlp_polish) return solve_core(p, opt, nullptr);
         const auto t0 = std::chrono::steady_clock::now();
         auto since = [&] {
             return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         };
-        SolverOptions loose = opt;
-        loose.set_tolerance(std::max(tight, 1e-4));
-        LpSolution main = solve_core(p, loose, nullptr);
-        if (main.status != Status::Optimal) return main;
+        Start s0;
+        s0.mode = 3;
+        LpSolution main = solve_core(p, opt, &s0);
+        if (main.status != Status::Optimal || opt.interrupted()) return main;
+        {   // the loose stop may already satisfy the full criteria
+            const double nbn = norm_b(p), ncn = norm_c(p);
+            if (main.primal_residual <= opt.eps_primal * (1 + nbn) &&
+                main.dual_residual <= opt.eps_dual * (1 + ncn) &&
+                main.gap <= opt.eps_gap * (1 + std::abs(main.primal_objective) + std::abs(main.dual_objective)) &&
+                main.error_bound <= 10 * opt.eps_gap * (1 + std::abs(main.primal_objective)))
+                return main;
+        }
         // primal feasibility from x (objective dropped)
         LpProblem pp = p;
         std::fill(pp.c.begin(), pp.c.end(), 0.0);
         pp.offset = 0;
         SolverOptions o1 = opt;
         o1.time_limit = std::max(1.0, opt.time_limit - since());
+        o1.max_iterations = std::max<long>(4000, main.iterations / 2);
         std::vector<double> y0(p.rows(), 0.0);
         Start s1{&main.x, &y0, 1};
         LpSolution a = solve_core(pp, o1, &s1);
@@ -88,6 +99,7 @@ template <template <typename> class Store = Cpu::HostStorage> class Pdlp {
         pd.offset = 0;
         SolverOptions o2 = opt;
         o2.time_limit = std::max(1.0, opt.time_limit - since());
+        o2.max_iterations = std::max<long>(4000, main.iterations / 2);
         std::vector<double> x0(p.cols(), 0.0);
         Start s2{&x0, &main.y, 2};
         LpSolution b = solve_core(pd, o2, &s2);
@@ -284,6 +296,11 @@ template <template <typename> class Store = Cpu::HostStorage> class Pdlp {
         };
         const int mode = start ? start->mode : 0;
         auto converged = [&](const Kkt &k) {
+            if (mode == 3) {
+                const double loose = std::max(100 * std::min(opt.eps_primal, opt.eps_dual), 1e-4);
+                return k.gap <= opt.eps_gap * (1 + std::abs(k.pobj) + std::abs(k.dobj)) &&
+                       k.pr_orig <= loose * (1 + nb) && k.dr_orig <= loose * (1 + nc);
+            }
             if (mode == 1) return k.pr_orig <= opt.eps_primal * (1 + nb);
             if (mode == 2) return k.dr_orig <= opt.eps_dual * (1 + nc);
             return k.pr_orig <= opt.eps_primal * (1 + nb) &&
@@ -307,7 +324,9 @@ template <template <typename> class Store = Cpu::HostStorage> class Pdlp {
         double last_restart_err = cur.err;
         double prev_cand_err = kInf;
         long it = 0, since_restart = 0;
-        const double eps_inf = 1e-8;
+        // Relative violation a ray may have and still count as a certificate: a
+        // fraction of the requested tolerance (the margins below reject round-off rays).
+        const double eps_inf = std::max(1e-8, 0.1 * std::min(opt.eps_primal, opt.eps_dual));
         // Minimum objective improvement of a certificate ray (unit norm),
         // relative to the problem's scale and the requested accuracy.
         const double cert_margin_dual = 10 * opt.eps_primal * (1 + qb);
@@ -377,6 +396,8 @@ template <template <typename> class Store = Cpu::HostStorage> class Pdlp {
                     return finish(Status::IterationLimit, *cx, *cy, it);
                 if (elapsed() > opt.time_limit)
                     return finish(Status::TimeLimit, *cx, *cy, it);
+                if (opt.interrupted())
+                    return finish(Status::Interrupted, *cx, *cy, it);
 
                 // restart?
                 const bool use_avg = have_avg && avg.err < cur.err;
@@ -498,4 +519,4 @@ template <template <typename> class Store = Cpu::HostStorage> class Pdlp {
 };
 
 } // namespace Solver
-} // namespace AXOS
+} // namespace Panini

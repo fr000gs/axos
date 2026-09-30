@@ -1,4 +1,4 @@
-// Solves MPS files with AXOS's LP solver (CPU and CUDA) and prints one line
+// Solves MPS files with Panini's LP solver (CPU and CUDA) and prints one line
 // per solve:
 //   RESULT mps <solver> <name> <ms> <iterations> <status> <objective> <pres> <dres> <gap>
 // The objective is in the model's own sense (max models are un-negated).
@@ -7,7 +7,7 @@
 //                   [--no-presolve] file.mps ...
 // The solver column is <method>_cpu / <method>_cuda.
 
-#ifdef AXOS_ENABLE_CUDA
+#ifdef PANINI_ENABLE_CUDA
 #include "tensorCuda.h"
 #endif
 #include "solver/solver.h"
@@ -17,8 +17,8 @@
 #include <string>
 #include <vector>
 
-using namespace AXOS;
-using namespace AXOS::Solver;
+using namespace Panini;
+using namespace Panini::Solver;
 
 template <template <typename> class Store>
 static void
@@ -76,6 +76,9 @@ main(int argc, char **argv)
         else if (a == "--normal") o.ipm_normal = 1;
         else if (a == "--halpern") o.pdlp_halpern = true;
         else if (a == "--polish") o.pdlp_polish = true;
+        else if (a == "--sequential") o.concurrent = false;
+        else if (a == "--pdlp-first") o.pdlp_first = 1;
+        else if (a == "--no-pdlp-first") o.pdlp_first = 0;
         else if (a == "--no-halpern") o.pdlp_halpern = false;
         else if (a == "--augmented") o.ipm_normal = -1;
         else if (a == "-v") o.verbose = true;
@@ -83,6 +86,24 @@ main(int argc, char **argv)
         else if (a == "--no-presolve") o.presolve = false;
         else files.push_back(a);
     }
+#ifdef PANINI_ENABLE_CUDA
+    if (cuda) { // one-time CUDA context / cuDSS / cuSPARSE setup, not timed
+        LpProblem w;
+        w.A = HostMatrix(1, 2, std::vector<int32_t>{0, 2}, std::vector<int32_t>{0, 1},
+            std::vector<double>{1.0, 1.0});
+        w.c = {1.0, 2.0};
+        w.col_lb = {0.0, 0.0};
+        w.col_ub = {kInf, kInf};
+        w.row_lb = {1.0};
+        w.row_ub = {kInf};
+        for (LpMethod m : {LpMethod::Ipm, LpMethod::Pdlp}) {
+            SolverOptions wo;
+            wo.method = m;
+            wo.presolve = false;
+            solve_lp<Cuda::CudaStorage>(w, wo);
+        }
+    }
+#endif
     for (const auto &f : files) {
         LpProblem p;
         try {
@@ -94,7 +115,7 @@ main(int argc, char **argv)
         std::string name = f.substr(f.find_last_of('/') + 1);
         name = name.substr(0, name.rfind('.'));
         run<Cpu::HostStorage>(mname + "_cpu", name, p, o);
-#ifdef AXOS_ENABLE_CUDA
+#ifdef PANINI_ENABLE_CUDA
         if (cuda) run<Cuda::CudaStorage>(mname + "_cuda", name, p, o);
 #endif
     }

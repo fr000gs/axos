@@ -25,7 +25,7 @@
 #include <cmath>
 #include <set>
 
-namespace AXOS {
+namespace Panini {
 namespace Sparse {
 
 enum class Symmetry { SPD, Symmetric };
@@ -99,6 +99,41 @@ min_degree_order(size_t n, const Idx *rp, const Idx *ci)
 }
 
 } // namespace detail
+
+// Approximate flop count (sum of squared column counts of L) of an LDL^T
+// factorization of the symmetric pattern (rp, ci) (full or one triangle) after
+// AMD ordering. Stops early and returns a value > cap once the count exceeds
+// cap (> 0), so hopeless factorizations are recognized cheaply. Used to decide
+// whether a direct factorization is worth attempting on any backend.
+// Returns +inf when `cancel` fires during the ordering.
+template <typename Idx>
+double
+symbolic_ldl_flops(size_t n, const Idx *rp, const Idx *ci, double cap = 0,
+    const std::function<bool()> &cancel = nullptr)
+{
+    if (n == 0) return 0;
+    std::vector<Idx> perm = amd_order<Idx>(n, rp, ci, cancel);
+    if (perm.size() != n) return std::numeric_limits<double>::infinity();
+    std::vector<Idx> pinv(n), parent(n, -1), flag(n), lnz(n, 0);
+    for (size_t k = 0; k < n; ++k) pinv[perm[k]] = static_cast<Idx>(k);
+    double flops = 0;
+    for (size_t k = 0; k < n; ++k) {
+        flag[k] = static_cast<Idx>(k);
+        const Idx kk = perm[k];
+        for (Idx p = rp[kk]; p < rp[kk + 1]; ++p) {
+            Idx i = pinv[ci[p]];
+            if (static_cast<size_t>(i) >= k) continue;
+            for (; flag[i] != static_cast<Idx>(k); i = parent[i]) {
+                if (parent[i] == -1) parent[i] = static_cast<Idx>(k);
+                flops += 2.0 * lnz[i] + 1.0; // (c+1)^2 - c^2
+                lnz[i]++;
+                flag[i] = static_cast<Idx>(k);
+            }
+        }
+        if (cap > 0 && flops > cap) return flops;
+    }
+    return flops;
+}
 
 template <typename T, typename Idx> class SparseLdlt<T, Idx, Cpu::HostStorage> {
     static_assert(std::is_floating_point_v<T>,
@@ -200,7 +235,7 @@ template <typename T, typename Idx> class SparseLdlt<T, Idx, Cpu::HostStorage> {
             factored_ = mf_.factorize(A.values(),
                 kind_ == Symmetry::SPD ? MultifrontalLdl<T, Idx>::Kind::SPD
                                        : MultifrontalLdl<T, Idx>::Kind::Symmetric,
-                signs_.empty() ? nullptr : signs_.data(), pivot_eps_);
+                signs_.empty() ? nullptr : signs_.data(), pivot_eps_, pivot_repl_);
             n_reg_ = mf_.regularized_pivots();
             failed_ = factored_ ? -1 : mf_.failed_pivot();
             return factored_;
@@ -248,7 +283,7 @@ template <typename T, typename Idx> class SparseLdlt<T, Idx, Cpu::HostStorage> {
             }
             if (!signs_.empty() && signs_[kk] != 0) {
                 const T sg = static_cast<T>(signs_[kk]);
-                if (!(sg * d_[k] >= pivot_eps_)) { d_[k] = sg * pivot_eps_; ++n_reg_; }
+                if (!(sg * d_[k] >= pivot_eps_)) { d_[k] = sg * (pivot_repl_ > T(0) ? pivot_repl_ : pivot_eps_); ++n_reg_; }
             }
             const bool bad = (kind_ == Symmetry::SPD) ? !(d_[k] > T(0))
                                                         : (d_[k] == T(0));
@@ -293,13 +328,21 @@ template <typename T, typename Idx> class SparseLdlt<T, Idx, Cpu::HostStorage> {
     // whose value times its sign is below `eps` is replaced by sign * eps, so
     // only pivots that really need it are perturbed. Returns via
     // regularized_pivots() how many were.
+    // repl > 0: such pivots become sign * repl instead. A huge repl drops the
+    // pivot's row from the solve (its solution component becomes ~0), the usual
+    // treatment of dependent rows in normal-equation Cholesky factorizations.
     void
-    set_pivot_regularization(std::vector<signed char> signs, T eps)
+    set_pivot_regularization(std::vector<signed char> signs, T eps, T repl = T(0))
     {
         signs_ = std::move(signs);
         pivot_eps_ = eps;
+        pivot_repl_ = repl;
     }
     size_t regularized_pivots() const { return n_reg_; }
+
+    // Optional cancellation check polled during the multifrontal factorization;
+    // factorize() then returns false with failed_pivot() == -2.
+    void set_cancel(std::function<bool()> f) { mf_.set_cancel(std::move(f)); }
 
     size_t factor_nnz() const { return analyzed_ ? factor_nnz_ : 0; }
     // approximate flop count of one numeric factorization (sum of squared column counts)
@@ -342,11 +385,11 @@ template <typename T, typename Idx> class SparseLdlt<T, Idx, Cpu::HostStorage> {
     bool analyzed_ = false, factored_ = false;
     long failed_ = -1;
     std::vector<signed char> signs_;
-    T pivot_eps_ = 0;
+    T pivot_eps_ = 0, pivot_repl_ = 0;
     size_t n_reg_ = 0;
     std::vector<Idx> perm_, pinv_, parent_, lnz_, flag_, lp_, li_;
     std::vector<T> lx_, d_;
 };
 
 } // namespace Sparse
-} // namespace AXOS
+} // namespace Panini

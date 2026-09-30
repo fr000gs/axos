@@ -1,33 +1,1055 @@
-AXOS reference manual
+TensorPanini reference manual (for v0.0.4-alpha)
 
-Last updated: 2026/09/25
+Last updated: 2026/09/24
 
-This branch contains the sparse linear algebra and LP solver layers only. The
-dense tensor layer they are built on (tensorET, its storage policies and the GPU
-memory pool) has been removed and is specified in docs/TENSOR_SPEC.md; until it
-is reimplemented the code here does not compile. The solver roadmap is
-src/solver/ROADMAP.md, benchmark results are in benchmarks/*/RESULTS.md.
+What changed since 0.0.2-alpha (summary):
 
-0. Building
+- CPU, CUDA and Vulkan tensors are now one class, tensorET<DIM, T, Storage>,
+  with the backend chosen by a storage policy (see 4.0). tensorETCuda and
+  tensorETVulkan are kept as type aliases, so existing code still compiles,
+  apart from the .mBuffer -> .storage_.mBuffer rename noted below.
+- Autograd ops dispatch through per-backend policy structs
+  (Panini::Cpu/Cuda/Vulkan::Backend) instead of per-backend copies of each op.
+- Vulkan buffers are now reached via t.storage_.mBuffer (was t.mBuffer).
+- New ONNX import path: ONNX graphs are translated to C++ and JIT-compiled
+  with libgccjit (see 6.7).
+- Fixed: slice()/reshape()/flatten() views lost their data pointer when
+  copied or moved (e.g. when handed to tensorML), which crashed flatten ->
+  linear and blocked matmul on views.
 
-Requirements: GNU Make, g++ with C++17 and OpenMP, Eigen 3 (tests and
-reference benchmarks). Optional: CUDA toolkit (nvcc, cuSPARSE, cuDSS, cuBLAS,
-cuSolver) with a host gcc that nvcc accepts (detected by `make configure`,
-override with NVCC_CCBIN=...).
+0. Introduction
 
-make test_sparse_cpu / make test_sparse     # sparse matrices, CPU / CPU+CUDA
-make test_solver_cpu / make test_solver     # LP solvers, CPU / CPU+CUDA
-make benchmark_sparse, make benchmark_lp, build/run_mps  (see 2)
-make reference_benchmarks                   # Eigen harnesses for TENSOR_SPEC.md
+TensorPanini is a header-only expression-template HPC library which focuses on
+compile time typing to deliver superior* performance while doing CUDA, Vulkan, 
+and AVX acceleration, ML autograd, and openMPI distributed compute.
 
-Pass --headless (or set HEADLESS=1, or pipe stdout) to the tests for plain text
-output.
+*superior as in slightly faster than Pytorch CUDA on certain tasks:
+
+### Small MLP Benchmark (Batch: 32, Input: 128, Hidden: 256, Output: 10)
+
+| Execution Phase | TensorPanini (CUDA) | PyTorch (CUDA) | Speedup (GPU) | TensorPanini (CPU) | PyTorch (CPU) | Speedup (CPU) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Forward Pass (Grad ON) | 0.042735 ms | 0.086803 ms | 2.03x | 0.102569 ms | 0.090637 ms | 0.88x |
+| Forward Pass (Grad OFF) | 0.029084 ms | 0.062336 ms | 2.14x | 0.128073 ms | 0.078879 ms | 0.62x |
+| Forward + Backward Pass | 0.075845 ms | 0.333999 ms | 4.40x | 0.290908 ms | 0.290930 ms | 1.00x |
+| SGD Optimizer Step | 0.009432 ms | 0.240036 ms | 25.44x | 0.019001 ms | 0.078620 ms | 4.14x |
+| Adam Optimizer Step | 0.015321 ms | 0.682603 ms | 44.55x | 0.148836 ms | 0.361188 ms | 2.43x |
+
+---
+
+### Large MLP Benchmark (Batch: 64, Input: 4096, Hidden: 8192, Output: 128)
+
+| Execution Phase | TensorPanini (CUDA) | PyTorch (CUDA) | Speedup (GPU) | TensorPanini (CPU) | PyTorch (CPU) | Speedup (CPU) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Forward Pass (Grad ON) | 1.825738 ms | 2.201166 ms | 1.21x | 28.6553 ms | 49.8051 ms | 1.74x |
+| Forward Pass (Grad OFF) | 1.774269 ms | 2.250340 ms | 1.27x | 25.8546 ms | 48.9894 ms | 1.85x |
+| Forward + Backward Pass | 4.896404 ms | 5.888932 ms | 1.20x | 74.8597 ms | 179.378 ms | 2.40x |
+| SGD Optimizer Step | 5.418350 ms | 5.315297 ms | 0.98x | 32.2927 ms | 29.5134 ms | 0.91x |
+| Adam Optimizer Step | 12.511761 ms | 31.140350 ms | 2.49x | 97.7484 ms | 286.595 ms | 2.93x |
+
+Cpu matmul and elimination also show a considerable speedup (upto 60%)
+
+0.1 Building 
+
+TensorPanini uses C++17 features and hence requires GCC 8 / GCC 9, or Clang 5. 
+(I only tested GCC14 and 15).
+
+MSVC 2017 is supposed to work but I don't have visual studio (or windows).
+
+Recommended compilation flags for CPU code:
+
+-O3 -march=native -fopenmp
+
+For the CUDA backend the library uses Nvidia CUDA toolkit's cuBLAS and cuDNN, 
+though these are actually optional for compiling code using the library and can
+be enabled with the -DCUBLAS_WITH and -DCUDNN_WITH. Usage of cudaMemcpyAsync 
+might mean CUDA 10 or lower might need tweaks.
+
+Recommended compilation flags for CUDA code:
+
+-O3 $(CPPFLAGS) -Xcompiler "-O3 -march=native -fopenmp" $(shell pkg-config --libs cudart cublas) -lcudnn
+
+(Add an -x cu if filename doesn't end in .cu)
+
+(For some reason nvidia doesn't ship .pc file for cudnn)
+
+Vulkan support is through the slang shader language, which supports generics
+ and interfaces, necessary for any kind of multiprecision.
+
+Recommended compilation flags for Vulkan code:
+
+-O3 -march=native -fopenmp $(shell pkg-config --libs vulkan)
+
+0.2 tensorPanini directory structure
+
+The tensorPanini repository contains the following directories:
+
+- benchmarks
+some benchark programs to test out various functions
+
+- build, build/shaders
+created automatically by make; benchmarks, tests and compiled .spv shaders
+go here by default
+
+- docs
+manually written markdown notes (some still describe the pre-0.0.4
+tensorETCuda/tensorETVulkan classes; this manual is the up-to-date source)
+
+- examples
+  - cartpole
+  This example uses the tensorML class to train a DQN agent to use a cartpole
+
+  - imagenet
+  Resnet50 implementation for ILSVRC data
+
+  - mnist
+  This example uses tensorML to train an MLP on mnist data
+
+  - model_verifier
+  Loads an exported ONNX ResNet18 through the ONNX JIT and checks it against
+  the same weights loaded from safetensors
+
+  - pulse-diffusion
+  Uses tensorET to solve for 1D pulse diffusion
+
+  - resnet
+  A resnet18 along with a distributed implementation
+
+  - tpbinding
+  Android app (Gradle project) running ResNet50 inference over Vulkan via JNI
+
+- src
+The main library source
+  - backends
+  per-backend policy structs (cpu_backend.h, cuda_backend.h,
+  vulkan_backend.h) and backend_traits.h
+  - storage
+  memory policies: HostStorage, CudaStorage, VulkanStorage
+  - shaders
+  Slang (Vulkan) and CUDA kernel implementations
+  - tensorcuda
+  GPU memory pool and cuBLAS/cuDNN/cuSolver handle cache
+  - tensorml
+  the subparts of the machine learning part (autograd, ops, optimizers,
+  serialization, ONNX/JIT)
+  - vulkan_runtime
+  Vulkan instance/device/pipeline runtime (Apache-2.0)
+
+- tests
+A test suite (make test_cpu / test_cuda / test_vk / test_all; see 0.6)
+
+0.3 Using the library
+
+tensorPanini, like Eigen (and unlike Blitz) is a header-only library, and does 
+not require any linking.
+
+0.4 Licensing terms
+
+tensorPanini is licensed under 3-clause BSD, however the vulkan runtime is 
+apache2. See the relevant LICENSE files for details.
+
+0.5 Support, contributions and bugs
+
+mail them to sbari.00001@gmail.com, or post it on Github Issues. Contributions
+are also welcome!
+
+0.6 Running the tests
+
+make test_cpu && ./build/test_cpu     # CPU only, no GPU toolchain needed
+make test_cuda && ./build/test_cuda   # needs nvcc
+make test_vk && ./build/test_vk       # needs slangc + a Vulkan device
+make test_all && ./build/test_all     # all backends, ncurses TUI
+
+Pass --headless (or set HEADLESS=1, or pipe stdout) to get plain text output
+instead of the TUI. tests/backend_conformance.h runs one shared set of
+checks against every backend.
+
+0.7 Known issues at release
+
+- Vulkan Adam/AdamW ignore weight_decay: AdamW on Vulkan currently behaves as
+  plain Adam. CPU and CUDA apply it correctly.
+- The ONNX importer treats unsupported ops as identity instead of
+  rejecting them (see 6.7).
+- slice()/reshape()/flatten() views work on CPU and CUDA tensors. On Vulkan
+  they return an empty buffer; wrap the existing buffer instead (see 4.2).
 
 -------------------------------------------------------
 
-1. Sparse Matrices & Direct Solves (src/sparse/)
+1. Tensors (Panini::tensorET)
 
-AXOS::Sparse::Csr<T, Idx = int32_t, Store = Cpu::HostStorage> is a
+Panini::tensorET is the single tensor class for every backend. Where its data
+lives (host RAM, CUDA device memory, a Vulkan buffer) is decided by its third
+template parameter, the Storage policy; tensorETCuda and tensorETVulkan are
+just aliases for the CUDA and Vulkan instantiations (see 4.0).
+
+It is defined in src/tensorET.h and uses CRTP to derive from Panini::baseTensorET
+(from src/tensorBase.h), so that operation trees can be cast back to tensors by
+the compiler itself, not requiring a runtime graph traversal or virtuals.
+
+1.1 Template Parameters & Data Layout
+
+tensorET takes three template parameters, the last one defaulted:
+  tensorET<int DIM, typename dataType,
+           typename Storage = Panini::Cpu::HostStorage<dataType>>
+
+- DIM is the rank of the tensor (1 for vector, 2 for matrix, N for N-dimensional
+  arrays).
+- dataType is the numeric element type (float, double, int, std::complex<T>,
+  half, etc.).
+- Storage is the memory policy: Cpu::HostStorage (default), Cuda::CudaStorage
+  or Vulkan::VulkanStorage. Plain CPU code never needs to spell it out.
+
+Example:
+
+#include "tensorET.h"
+
+Panini::tensorET<1, double> v(100); // 1D tensor of 100 doubles
+Panini::tensorET<2, float> A({64, 128}); // 2D tensor of 64x128 floats
+Panini::tensorET<4, float> B({32, 3, 224, 224}); // 4D image batch tensor
+
+Fields in tensorET:
+
+- size_t numElem: total number of elements.
+- const int dimINT: internal padded dimension size (calculated via
+  vectorSizeHelper<DIM>::Vsize, which pads DIM to at least 3 so 1D/2D tensors
+  share 3D indexing logic).
+- size_t indexSize[dimINT]: extent size along each dimension.
+- bool ownmem: flag indicating whether data buffer is owned and should be freed
+  on destruction.
+- dataType* data: raw pointer to contiguous element storage (a device pointer
+  for CUDA storage, nullptr for Vulkan storage).
+- Storage storage_: the storage policy object that owns/frees the memory. For
+  Vulkan, the buffer handle is storage_.mBuffer.
+- size_t strides[dimINT]: element strides for index offset calculation;
+  stride(d) returns the stride of logical dimension d.
+- placeHolderND<dimINT> index: internal domain bounding box helper storing sizes
+  n[], start[], and end[].
+
+1.2 Constructors & Initialization
+
+- Default constructor:
+  Panini::tensorET<DIM, dataType> A;
+  Creates an empty tensor (data = nullptr, numElem = 0, ownmem = false).
+
+- 1D constructor:
+  Panini::tensorET<1, double> A(100); // uninitialized
+  Panini::tensorET<1, double> B(100, 3.14); // initialized with 3.14
+
+- Initializer list constructor:
+  Panini::tensorET<2, float> A({32, 64}); // uninitialized
+  Panini::tensorET<2, float> B({32, 64}, 0.0f); // initialized with 0.0
+
+- Domain constructor:
+  size_t shape[2] = {10, 10};
+  size_t start[2] = {0, 0};
+  size_t end[2] = {9, 9};
+  Panini::tensorET<2, double> A(shape, start, end);
+
+- Expression constructor:
+  Panini::tensorET<2, float> C = A + B;
+  Evaluates lazy expression templates directly into memory.
+
+- Non-owning raw data wrapper:
+  float external_buffer[1024];
+  size_t shape[2] = {32, 32};
+  Panini::tensorET<2, float> view(external_buffer, shape);
+  (Wraps external memory without copying. Sets ownmem = false so destructor
+  won't free buffer).
+  Panini::tensorET<2, float> owned(malloced_ptr, shape, /*own=*/true);
+  (Three-argument form: takes ownership of a buffer allocated by the
+  matching storage policy, e.g. a device buffer for tensorETCuda.)
+
+- Cross-backend copy:
+  Panini::tensorETCuda<2, float> g = cpu_tensor;   // upload
+  Panini::tensorET<2, float> h = g;                // download
+  Any tensorET converts to any other tensorET of the same DIM and dataType;
+  transfers go through the backends' copy_to_host/copy_from_host.
+
+- Random number generators:
+  auto A = Panini::tensorET<2, float>::uniform({64, 64}, -1.0f, 1.0f);
+  auto B = Panini::tensorET<2, float>::gaussian({64, 64}, 0.0f, 1.0f);
+
+1.3 Indexing & Element Access
+
+Access elements using coordinate operator() or 1D flat operator[]:
+
+Panini::tensorET<2, double> A({4, 4}, 0.0);
+
+A(1, 2) = 5.5; // 2D coordinate access
+double x = A(1, 2);
+
+A[6] = 2.0; // 1D linear access into raw buffer
+double y = A.value(6);
+
+For a tensor of rank DIM, operator() computes linear offset:
+  linearIndex = sum(idx[i] * strides[dimINT - DIM + i])
+
+!NOTE: On CUDA/Vulkan tensors only the const, read-only forms exist: A(i, j),
+A[i] and A.value(i) return the element by value, and each call does a
+one-element device-to-host copy. That's fine for spot checks and too slow
+for loops; copy the tensor to a host tensorET first. Writable element access
+(A(i, j) = x) doesn't compile for GPU storage.
+
+1.4 Slicing, Reshaping & Views
+
+- Slice view:
+Panini::tensorET<2, float> A({100, 100}, 1.0f);
+// Extract a 10x10 slice starting at (20, 30)
+auto sub = A.slice({20, 30}, {10, 10});
+slice() returns a non-owning tensor view sharing the same data pointer with
+adjusted strides and bounds. Views keep the source's Storage type and stay
+valid when copied or moved, but not after the source tensor is destroyed.
+
+- Reshape:
+Panini::tensorET<2, float> A({8, 8});
+// Reshape 8x8 matrix into 1D vector of size 64
+auto v = A.reshape<1>({64});
+// Or into 3D tensor (2x4x8)
+auto t = A.reshape<3>({2, 4, 8});
+
+- Flatten:
+auto flat = A.flatten(); // equivalent to A.reshape<1>({A.size()})
+
+1.5 Sub-block Tiling
+
+For blocked matrix algorithms, tensorET<2, T> provides tile extraction and
+write-back:
+
+Panini::tensorET<2, double> A({1000, 1000}, 1.0);
+double tile_buf[64 * 64];
+
+// View tile (i=2, j=3) of block size 64x64
+auto view = A.blockView(2, 3, 64);
+
+// Copy tile (i=2, j=3) into tile_buf (with optional transpose)
+A.blockCopy(2, 3, 64, tile_buf, /*transpose=*/false);
+
+// Extract tile into a new tensorET object
+auto tile = A.blockCopy(2, 3, 64);
+
+// Write modified tile back to parent tensor
+A.blockWriteBack(2, 3, 64, tile);
+
+// Accumulate tile back into parent tensor (+=)
+A.blockAddWriteBack(2, 3, 64, tile);
+
+These member functions are host-only. For CUDA tensors, the stream-aware free
+functions Panini::blockCopyCuda(A, ...) and Panini::blockWriteBackCuda(A, ...)
+(tensorCuda.h) do the same job; the blocked Householder QR in
+shaders/tensorLA.cu uses them.
+
+1.6 Expression Templates & Math Operations
+
+Panini avoids temporary array allocations by constructing expression objects
+derived from baseTensorET.
+
+Panini::tensorET<2, float> A({100, 100}, 2.0f);
+Panini::tensorET<2, float> B({100, 100}, 3.0f);
+Panini::tensorET<2, float> C({100, 100});
+
+// Expression template - no temporary allocated
+C = A + B * 2.0f;
+
+Unary math functions (each returns a lazy expression, so they fuse, e.g.
+C = exp(sin(A) + cos(A)) is a single pass):
+C = Panini::sqrt(A);
+C = Panini::exp(A);
+C = Panini::Log(A);
+C = Panini::sin(A);
+C = Panini::cos(A);
+C = Panini::tan(A);
+C = Panini::sinh(A);
+C = Panini::cosh(A);
+C = Panini::tanh(A);
+C = Panini::fabs(A);
+(The expression classes they return are named sqRoot, exponential,
+logarithm, sine, ... ; you don't normally name them yourself.)
+
+Matrix multiplication:
+// 1. Lazy expression evaluation
+auto expr = Panini::matMul(A, B); 
+
+// 2. OpenMP tiled matrix multiplication
+Panini::tensorET<2, float> C({100, 100}, 0.0f);
+Panini::matMulBlocked(A, B, C, m, alpha, bias, beta, /*tranpose flags*/);
+
+Stream I/O (src/tensorIO.h): operator<< is defined for tensorET<DIM, T> of
+any rank, printing nested bracketed rows -- mainly useful for debugging
+small tensors, not a serialization format (see 6.2 for that).
+
+std::cout << A << std::endl;
+
+1.7 Linear Algebra (src/tensorLinearAlgebra.h)
+
+These are free functions operating on tensorET<2, T> (matrices) and
+tensorET<1, T> (vectors); there's no separate matrix class. Everything here
+is CPU-only. Include tensorLinearAlgebra.h directly; it pulls in tensorET.h.
+
+Solvers:
+
+#include "tensorLinearAlgebra.h"
+
+// Conjugate gradient, for symmetric positive-definite A.
+// x0 is the initial guess; maxIter defaults to n (pass -1 to use it).
+Panini::tensorET<1, double> x =
+    Panini::conjugateGradient(A, b, x0, /*maxIter=*/-1, /*tolerance=*/1e-6);
+
+// LU decomposition without pivoting (throws if a pivot falls below
+// tolerance -- fine for diagonally-dominant systems, not general A).
+auto [L, U] = Panini::luDcmp(A);
+
+// Pivoted LU -- use this one unless you know A doesn't need pivoting.
+// Returns {{L, U}, P}.
+auto lu = Panini::luDcmpPivoted(A);
+auto &[L, U] = lu.first;
+auto &P = lu.second;
+
+// Solve A x = b given an existing LU factorization (matrix or vector RHS
+// overloads are both provided).
+Panini::tensorET<1, double> x2 = Panini::luSolve(L, U, P, b);
+
+Tiled variants (luDcmpPivotedTile, qrDecompositionTile) exist for larger
+matrices.
+
+Orthogonalization & elimination:
+
+// Classic Gram-Schmidt: columns of V are orthonormalized in place.
+auto Q = Panini::gramSchmidtOrthogonalization(V);
+
+// Reduces A to reduced row-echelon form.
+auto rref = Panini::gaussJordanElimination(A);
+
+// Build [A | b] for feeding into gaussJordanElimination / luSolve by hand.
+auto Ab = Panini::augmentMatrix(A, b);
+
+Eigenproblems:
+
+// Lanczos: builds a tridiagonal approximation of symmetric A in an
+// m-dimensional Krylov subspace, starting from q0.
+Panini::LanczosResult<double> result = Panini::lanczos(A, m, q0);
+// result.alpha, result.beta are the tridiagonal diagonals; result.Q holds
+// the Krylov basis vectors.
+
+// LOBPCG: iterative solver for the nev smallest eigenpairs of symmetric A,
+// starting from an initial subspace X0. Writes into eigvals/X.
+Panini::tensorET<1, double> eigvals;
+Panini::tensorET<2, double> X;
+Panini::lobpcg(A, nev, X0, eigvals, X, /*maxIter=*/100, /*tol=*/1e-8);
+
+expm(A) computes the matrix exponential; norm(A, B, p) and the string-typed
+overload (norm(A, B, "fro") etc.) compute distances/norms between two
+tensors of the same rank.
+
+Elimination-op history: elimStep records a sequence of row-elimination and
+permutation operations (as Op, a union of ElimOp and PermOp) on a binary
+gaussian elimination scheme looped by revEl. matMul(history, A) and matMul(A,
+history) then replay that history against another matrix -- this is how
+inverse_backs computes a matrix inverse without re-deriving pivots: it runs
+elimination once, and replays the recorded ops against the identity.
+
+The binary nature of inverse_backs means that it gives a considerable speedup
+wrt normal gaussian eliminationi when ran in parallel. It has generally held up
+against test cases, but has not been tested for ALL test cases possible.
+
+-------------------------------------------------------
+
+2. Extending Panini with Custom Expressions & Kernels
+
+You can extend Panini by creating your own expression templates, math functions,
+or backend kernels.
+
+2.1 Writing Custom Expression Templates
+
+To define a custom unary or binary expression, inherit from Panini::baseTensorET
+using CRTP and implement value(int i) and size(int dim):
+
+template <typename dataType, class T>
+class CustomSquare : public Panini::baseTensorET<dataType, CustomSquare<dataType, T>> {
+    const T& t;
+public:
+    CustomSquare(const T& t_) : t(t_) {}
+
+    // Compute value at flat index i on demand
+    dataType value(int i) const {
+        dataType v = t.value(i);
+        return v * v;
+    }
+
+    // Return size along dimension dim
+    size_t size(int dim) const {
+        return t.size(dim);
+    }
+};
+
+// Convenience wrapper function
+template <typename dataType, class T>
+inline CustomSquare<dataType, T> customSquare(const Panini::baseTensorET<dataType, T>& exp) {
+    return CustomSquare<dataType, T>(static_cast<const T&>(exp));
+}
+
+Usage:
+Panini::tensorET<1, float> x(10, 3.0f);
+Panini::tensorET<1, float> y = customSquare(x); // y[i] = 9.0f
+
+2.2 Custom CUDA Kernels
+
+To run custom CUDA kernels on tensorETCuda, access the underlying device pointer
+.data:
+
+#include "tensorCuda.h"
+
+__global__ void customPowerKernel(float* data, float p, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        data[idx] = powf(data[idx], p);
+    }
+}
+
+void applyPower(Panini::tensorETCuda<1, float>& t, float p) {
+    int blockSize = 256;
+    int gridSize = (t.size() + blockSize - 1) / blockSize;
+    customPowerKernel<<<gridSize, blockSize>>>(t.data, p, t.size());
+    cudaDeviceSynchronize();
+}
+
+2.3 Custom Vulkan Compute Kernels
+
+To launch custom Vulkan compute shaders on tensorETVulkan:
+
+#include "tensorVulkan.h"
+
+// Define push constants struct matching shader layout
+struct PushParams {
+    uint32_t numElem;
+    float factor;
+};
+
+void applyVulkanScale(Panini::tensorETVulkan<1, float>& t, float factor) {
+    PushParams params{ static_cast<uint32_t>(t.size()), factor };
+    uint32_t gx = (t.size() + 255) / 256;
+    
+    // Dispatch compute shader using Vulkan Runtime
+    Panini::Vulkan::Runtime::get().dispatch<PushParams>(
+        "shaders/scale.spv", gx, 1, 1, { &t.storage_.mBuffer }, params
+    );
+}
+
+2.4 Adding an autograd op to every backend
+
+Autograd ops in tensorml/ops.h don't call CUDA or Vulkan directly. They call
+backend_of_t<TensorType>::<op>_fwd / <op>_grad, which resolves at compile time
+to Panini::Cpu::Backend, Cuda::Backend or Vulkan::Backend. To add an op,
+implement the same-named static functions in src/backends/cpu_backend.h,
+cuda_backend.h and vulkan_backend.h, then call them from a node in ops.h.
+Look at relu_fwd/relu_grad for a small complete example. A backend that
+leaves out an op only fails when that op is instantiated for that backend.
+
+-------------------------------------------------------
+
+3. Multiprecision & Custom Data Types
+
+TensorPanini supports standard arithmetic types, complex numbers, native IEEE
+float16, and custom half-precision structs. There is a multiprecision feature
+branch for Vulkan, but it has some floating point issues (inf, nan).
+
+3.1 The Numeric<dataType> Constraint
+
+tensorBase.h constrains tensor types using the Numeric<dataType> type trait:
+
+template<typename dataType>
+using Numeric = std::enable_if_t<
+    std::is_arithmetic<dataType>::value ||
+    is_complex<dataType>::value ||
+    std::is_same<dataType, half>::value ||
+    std::is_same<dataType, float16_native_t>::value,
+    dataType>;
+
+This permits float, double, int, long long, std::complex<float>,
+std::complex<double>, half, and _Float16.
+
+3.2 Native _Float16 and Half Struct
+
+On Clang or GCC (x86_64/aarch64), HAS_FLOAT16 is enabled, aliasing
+float16_native_t to native compiler _Float16.  When compiling without native
+hardware float16 support or CUDA, Panini provides a fallback half struct:
+
+#include "tensorBase.h"
+
+// 16-bit half precision allocation
+Panini::tensorET<1, half> h_vec(100, half(1.5));
+
+// Convert to float
+float val = static_cast<float>(h_vec(0));
+
+Under CUDA nvcc (__CUDACC__), half uses CUDA's native <cuda_fp16.h>.
+
+3.3 Complex Numbers
+
+Panini fully supports std::complex<T>:
+
+#include <complex>
+#include "tensorET.h"
+
+using ComplexF = std::complex<float>;
+
+Panini::tensorET<2, ComplexF> A({4, 4}, ComplexF(1.0f, 2.0f));
+Panini::tensorET<2, ComplexF> B({4, 4}, ComplexF(3.0f, -1.0f));
+
+Panini::tensorET<2, ComplexF> C = A + B;
+
+-------------------------------------------------------
+
+4. GPU Backends & Custom Memory Pools
+
+4.0 Storage and Backend policies
+
+Two things decide how a tensor behaves on a backend:
+
+- Storage policy (src/storage/): owns the memory. HostStorage, CudaStorage
+  and VulkanStorage each implement allocate/fill/copy/move/free, and each
+  names its backend through a backend_type typedef.
+- Backend policy (src/backends/): a struct of static functions for that
+  backend (matmul_fwd, conv2d_grad, adam_step, copy_to_host, read_element,
+  ...) plus a tensor<DIM, T> alias for that backend's tensor type.
+
+Panini::backend_of_t<T> (backends/backend_traits.h) maps any tensor, or any
+tensorML wrapping one, to its Backend. Generic code uses it to get the right
+functions and the right tensor type at another rank:
+
+template <typename TensorType>
+void foo(const TensorType &x) {
+    using B = Panini::backend_of_t<TensorType>;
+    using Vec = typename B::template tensor<1, float>;
+    // B::copy_to_host(x, host_ptr); ...
+}
+
+The convenience aliases are:
+
+template <int DIM, typename T>
+using tensorETCuda = tensorET<DIM, T, Cuda::CudaStorage<T>>;      // tensorCuda.h
+template <int DIM, typename T>
+using tensorETVulkan = tensorET<DIM, T, Vulkan::VulkanStorage<T>>; // tensorVulkan.h
+
+Because they are alias templates with two parameters, they can still be passed
+where a template<int, typename> class parameter is expected, e.g.
+ResNet50<tensorETVulkan>.
+
+4.1 CUDA Backend & Memory Pool (tensorETCuda)
+
+tensorETCuda is tensorET with CudaStorage: the same class, with its memory
+allocated on the NVIDIA GPU.
+
+#include "tensorCuda.h"
+
+Panini::tensorETCuda<2, float> gpu_A({1024, 1024}, 1.0f);
+Panini::tensorETCuda<2, float> gpu_B({1024, 1024}, 2.0f);
+
+// Upload CPU tensorET to GPU
+Panini::tensorET<2, float> cpu_A({1024, 1024}, 5.0f);
+Panini::tensorETCuda<2, float> gpu_from_cpu = cpu_A;
+
+// Download GPU tensor to CPU
+Panini::tensorET<2, float> cpu_back = gpu_from_cpu;
+
+GPUMemoryPool (src/tensorcuda/gpu_pool.h):
+Frequent cudaMalloc and cudaFree calls stall the GPU pipeline. tensorETCuda
+routes allocations through GPUMemoryPool singleton:
+
+- Maintains a vector of free memory blocks (std::vector<Block> free_blocks).
+- All allocations are aligned to GPU_POOL_ALIGNMENT_BYTES (256 bytes).
+- Configurable allocation modes via GPUAllocatorConfig:
+  - GPUAllocator::Pool (default): reusable memory block pool.
+  - GPUAllocator::Raw: direct cudaMalloc / cudaFree calls.
+  - GPUAllocator::Async: stream-ordered cudaMallocAsync.
+
+GPUMemoryPool also manages handles for cuBLAS (cublasHandle_t), cuSolver
+(cusolverDnHandle_t), and cuDNN (cudnnHandle_t), caching cuDNN 2D convolution
+descriptors (ConvCacheKey -> ConvCacheEntry).
+
+Choosing an allocator:
+
+tensorETCuda goes through GPUMemoryPool::get(), which is a thread_local
+singleton templated on GPUAllocatorConfig<mode>. The mode is a compile-time
+choice, not a runtime flag, so switching means instantiating tensorETCuda
+against a different pool type:
+
+Default: reuse blocks internally, cudaMalloc only on a size miss. Best default
+for training loops with a stable set of tensor shapes; steady-state allocation
+is just a free-list pop.
+
+using DefaultPool = Panini::GPUMemoryPoolTemplate<>; // GPUAllocator::Pool
+
+Direct cudaMalloc/cudaFree per call. No free-list bookkeeping, so shapes that
+vary every iteration won't fragment a pool. Costs a real cudaMalloc (device-wide
+sync point) per allocation -- fine outside hot loops (one-off buffers, debugging
+a suspected pool-related bug), bad inside one.
+
+using RawPool = Panini::GPUMemoryPoolTemplate<
+    Panini::GPUAllocatorConfig<Panini::GPUAllocator::Raw>>;
+
+Stream-ordered cudaMallocAsync/cudaFreeAsync. Intended for pipelines that
+overlap allocation with async work on a stream. This is experimental, and it
+crashed the last time I tested it.
+
+using AsyncPool = Panini::GPUMemoryPoolTemplate<
+    Panini::GPUAllocatorConfig<Panini::GPUAllocator::Async>>;
+
+4.2 Vulkan Backend & Runtime (tensorETVulkan)
+
+tensorETVulkan provides GPU acceleration on any GPU supporting Vulkan (AMD,
+Intel, Nvidia, ARM Mali, Adreno).
+
+#include "tensorVulkan.h"
+
+Panini::tensorETVulkan<2, float> v_mat({512, 512}, 1.0f);
+
+// Copy host to Vulkan GPU
+Panini::tensorET<2, float> host_mat({512, 512}, 3.0f);
+Panini::tensorETVulkan<2, float> v_gpu = host_mat;
+
+// Download back to host
+Panini::tensorET<2, float> host_out = v_gpu;
+
+// Raw buffer handle, for dispatching your own shaders (see 2.3)
+Panini::Vulkan::Buffer &buf = v_gpu.storage_.mBuffer;
+
+// Non-owning view of an existing buffer with a different shape (use this
+// instead of reshape(), which doesn't carry the buffer over on Vulkan)
+size_t dims[1] = {512 * 512};
+Panini::tensorETVulkan<1, float> flat(
+    Panini::Vulkan::VulkanStorage<float>(v_gpu.storage_.mBuffer, v_gpu.size(),
+                                         /*own=*/false),
+    dims);
+
+Vulkan Runtime (src/vulkan_runtime/vulkanRuntime.h):
+- VulkanContext manages VkInstance, VkPhysicalDevice, VkDevice, VkQueue,
+  VkCommandPool, VkDescriptorPool.
+- Vulkan::Runtime::get() singleton manages buffer uploads, downloads, descriptor
+  set binding, and shader pipeline caching (mPipelineCache).
+- Shaders are compiled from Slang to SPIR-V.
+- Profiling: -DPANINI_PROFILE_VULKAN enables timestamp query pools
+  (vkCmdWriteTimestamp) to measure kernel execution times.
+
+-------------------------------------------------------
+
+5. Parallel Computing & Distributed Execution (MPI)
+
+Panini supports distributed memory parallel computing via MPI (src/tensorMPI.h
+and src/tensorml/tensorml_distributed.h).
+
+This support is not yet fully implemented and this is just a minimal
+implementation.
+
+5.1 Initialization & Communicators
+
+Panini::MPI::Comm wraps MPI_Comm. Get the global communicator using Comm::world():
+
+#include "tensorMPI.h"
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    
+    auto& comm = Panini::MPI::Comm::world();
+    int rank = comm.rank();
+    int size = comm.size();
+
+    MPI_Finalize();
+}
+
+5.2 Collectives
+
+Panini provides allreduce_sum, iallreduce_sum (non-blocking), and bcast
+for both CPU tensorET and GPU tensorETCuda:
+
+Panini::tensorET<1, float> data(100, 1.0f);
+
+// Collective all-reduce sum across processes
+comm.allreduce_sum(data);
+
+// Non-blocking all-reduce
+Panini::MPI::Request req = comm.iallreduce_sum(data);
+req.wait();
+
+// Broadcast root tensor to all ranks
+comm.bcast(data, /*root=*/0);
+
+For CUDA tensors (tensorETCuda), Comm automatically uses pinned host staging
+memory (allocated via cudaMallocHost) to handle host-device transfers during
+MPI calls.
+
+5.3 Domain Decomposition & Halo Exchange
+
+For PDE solvers on grid domains, CartComm creates a 1D/2D Cartesian topology
+and performs non-blocking boundary halo exchanges:
+
+int dims[1] = { comm.size() };
+int periods[1] = { 1 }; // periodic boundaries
+Panini::MPI::CartComm cart(comm, 1, dims, periods);
+
+// Local grid with 2 halo cells (left & right)
+size_t nx_local = 100;
+Panini::tensorET<1, double> grid(nx_local + 2, 0.0);
+
+// Non-blocking halo exchange (swaps boundary cells with left/right neighbors)
+cart.halo_exchange(grid);
+
+5.4 Distributed Autograd & Tensor Parallelism
+
+For distributed deep learning (tensorml_distributed.h):
+
+- Distributed Data Parallel (DDP) gradient synchronization:
+
+std::vector<Panini::tensorML<2, float, TensorType>*> params = model.parameters();
+Panini::MPI::ddp_sync_gradients(params, comm);
+Performs allreduce sum on parameter gradients and scales by 1.0 / comm.size().
+
+- Megatron-style Tensor Parallelism:
+  - column_parallel_linear(input, weight, bias, comm)
+  - row_parallel_linear(input, weight, bias, comm)
+Splits linear layer weight matrices across ranks along column or row dimensions,
+inserting tp_allreduce_fwd or tp_allreduce_bwd communications into the
+autograd DAG automatically.
+
+-------------------------------------------------------
+
+6. Machine Learning & Autograd (Panini::tensorML)
+
+tensorML<DIM, dataType, TensorType> (src/tensorml.h) provides reverse-mode
+automatic differentiation.
+
+6.1 Autograd DAG Mechanics
+
+Every tensorML wraps an underlying storage tensor (value), gradient tensor
+(grad), boolean requires_grad, and a shared pointer to a computation graph
+Node.
+
+#include "tensorml.h"
+
+using TensorType = Panini::tensorET<2, float>;
+using Var = Panini::tensorML<2, float, TensorType>;
+
+// Create trainable variables
+Var W(TensorType({10, 784}, 0.01f), /*requires_grad=*/true);
+Var x(TensorType({784, 1}, 1.0f), /*requires_grad=*/false);
+Var b(TensorType({10, 1}, 0.0f), /*requires_grad=*/true);
+
+// Forward pass builds computation graph
+Var y = Panini::matMul(W, x) + b;
+Var loss = Panini::mse_loss(y, target);
+
+// Backward pass computes gradients
+loss.backward();
+
+// Access gradient
+TensorType W_grad = W.grad();
+
+6.2 Parameters, Modules & Serialization
+
+There are two ways to compose a model, and which one you want depends on
+whether every parameter tensor shares the same rank.
+
+Single-rank models -- inherit Panini::Module<DIM, dataType, TensorType> and
+implement parameters():
+
+struct LinearNet : public Panini::Module<2, float, TensorType> {
+    Var W, b;
+    LinearNet(int in_dim, int out_dim)
+        : W(Var::gaussian({out_dim, in_dim}, 0.0f, 0.1f, true)),
+          b(TensorType({out_dim, 1}, 0.0f), true) {}
+
+    std::vector<Var*> parameters() override {
+        return { &W, &b };
+    }
+
+    Var forward(const TensorType& in) const {
+        auto x = Var::make_temp(in, false);
+        return Panini::matMul(W, x) + b;
+    }
+};
+
+Module gives you zero_grad(), copy_weights_from() (for target-network sync
+in RL, etc.), and a raw binary save_state_dict(path) / load_state_dict(path)
+-- a flat dump of parameter tensors in declaration order, with no names or
+shape metadata. It's the fastest way to checkpoint but the file isn't
+portable across a model whose parameter order or shapes have changed.
+
+Mixed-rank models (conv weights are rank 4, biases rank 1, FC weights rank
+2 -- e.g. ResNet50 in rn50.cpp) don't fit a single Module<DIM,...>. These
+implement their own recursive walk_module(prefix, visitor) by convention
+(no base class required) that visits every named parameter:
+
+struct BNLayer {
+    Var weight, bias;
+    // ...
+    template <typename Visitor>
+    void walk_module(const std::string& prefix, Visitor&& visitor) {
+        visitor(prefix + ".weight", weight);
+        visitor(prefix + ".bias", bias);
+    }
+};
+
+struct ResNet50 {
+    BNLayer stemBN;
+    BottleneckBlock b1a, b1b, b1c /* ... */;
+    // ...
+    template <typename Visitor>
+    void walk_module(const std::string& prefix, Visitor&& visitor) {
+        stemBN.walk_module(prefix + "bn1", visitor);
+        b1a.walk_module(prefix + "layer1.0", visitor);
+        // ...
+    }
+};
+
+This is the convention Panini::SafeTensors::save/load (src/tensorml/
+safetensors.h) rely on: they call module.walk_module("", visitor) and use
+the (name, param) pairs as the safetensors JSON header keys, so files are
+portable across param reordering as long as names match.
+
+Panini::SafeTensors::save(path, net);
+Panini::SafeTensors::load(path, net); // throws if a named param is missing
+
+(ONNX models can also be imported and run for inference; see 6.7.)
+
+Because parameters now span multiple ranks, you need one optimizer per rank
+(see 6.5) rather than a single Module::parameters() list -- ResNet50 above
+exposes params_4d()/params_2d()/params_1d() accessors for exactly this.
+
+6.3 Built-in Layers
+
+tensorml.h ships autograd-aware NN layers beyond plain matMul, all under
+Panini:: and all available for tensorET/tensorETCuda/tensorETVulkan (Vulkan
+coverage currently: conv2d, batch_norm, pooling, linear -- see the source
+for the current per-backend list before relying on one).
+
+// 2D convolution: input/weight are NCHW rank-4, bias is rank-1 (or omit it).
+Var y = Panini::conv2d(input, weight, bias, /*stride=*/1, /*padding=*/1);
+
+// BatchNorm: running_mean/running_var are updated in place when training.
+Var y = Panini::batch_norm(input, running_mean, running_var, weight, bias,
+                            /*training=*/true); // momentum/eps have defaults
+
+// Pooling
+Var y = Panini::max_pool2d(input, /*kh=*/3, /*kw=*/3, /*stride=*/2, /*padding=*/1);
+Var y = Panini::adaptive_avg_pool2d(input, /*out_h=*/1, /*out_w=*/1);
+
+// Fully connected: input [N,K], weight [K,M], bias [1,M] (broadcasts over N).
+Var y = Panini::linear(input, weight, bias);
+
+// Shape ops: reshape is general DIM_IN -> DIM_OUT; flatten is the common
+// [N,C,H,W] -> [N, C*H*W] case (only valid once H=W=1, i.e. after a pool).
+Var y = Panini::reshape<2>(x, std::array<size_t,2>{N, C});
+Var y = Panini::flatten(x);
+
+Var yT = Panini::transpose(x); // 2D only
+
+6.4 Loss Functions
+
+Panini::tensorML<DIM, float, TensorType> loss;
+
+// Mean squared error against a plain (non-autograd) target tensor.
+loss = Panini::mse_loss(pred, target);
+
+// Huber, batched: targets/indices are parallel host-side vectors selecting
+// which flat elements of pred each target applies to.
+loss = Panini::huber_loss_batch(pred, targets, indices, /*delta=*/1.0f);
+
+// Cross-entropy, batched: logits is [num_classes, batch], labels is a
+// std::vector<size_t> of length batch (not a one-hot tensor).
+loss = Panini::cross_entropy_loss_batch(logits, labels);
+
+6.5 Optimizers
+
+Each optimizer template-binds to one tensor rank, so a mixed-rank model
+needs one optimizer instance per rank (see rn50.cpp's opt4/opt2/opt1 for an
+example against Conv/Linear/bias parameters respectively).
+
+// SGD with momentum
+Panini::SGD<2, float, TensorType> opt_sgd(params_2d, /*lr=*/1e-2, /*momentum=*/0.9);
+
+// Adam
+Panini::Adam<2, float, TensorType> opt_adam(params_2d, /*lr=*/1e-3);
+
+// AdamW (decoupled weight decay -- separate from Adam's L2-via-gradient)
+Panini::AdamW<2, float, TensorType> opt_adamw(params_2d, /*lr=*/1e-3,
+    /*beta1=*/0.9, /*beta2=*/0.999, /*eps=*/1e-8, /*weight_decay=*/1e-2);
+
+opt_adam.zero_grad();
+// ... forward pass & loss.backward()
+opt_adam.step();
+
+Panini::NewtonOptimizer<float, TensorType> is a 2nd-order optimizer taking
+a std::vector<Panini::Parameter<float, TensorType>> (a type-erased handle
+over a tensorML's data/grad, also what walk_module ultimately exposes) and
+a loss-producing closure; it computes gradients via finite differences
+around the current weights rather than backward(), so it's for small
+parameter counts, not a drop-in Adam replacement. Panini::newtonMethod is
+the related root-finder for solving F(x) = 0 directly rather than
+minimizing a loss.
+
+6.6 Data Loading
+
+Panini::DataLoader<BatchType> (src/tensorml/data_loader.h) is a generic
+double-buffered async prefetcher: while you consume one buffer, a
+background thread fills the other via a worker function you supply.
+
+Panini::DataLoader<Batch> loader(
+    /*worker_fn=*/[&](Batch& b, size_t batch_idx) { fill_batch(b, batch_idx); },
+    /*total_batches=*/num_batches);
+
+for (size_t i = 0; i < num_batches; ++i) {
+    Batch& b = loader.next(); // blocks until the prefetch thread has it ready
+    // ... train on b ...
+    loader.release(); // signal done with this buffer, let prefetch continue
+}
+loader.reset(); // rewind for the next epoch
+
+Note that rn50.cpp's own ImageNetDataLoader doesn't build on this, it's a
+separate, bounded-queue producer/consumer loader hand-rolled for that example.
+If you're writing a new data pipeline, Panini::DataLoader is the reusable
+library piece, however I'd try unifying them soon.
+
+6.7 ONNX Import & JIT Inference (src/tensorml/onnx.h)
+
+Panini::ONNX::Model loads an .onnx file, generates C++ source that rebuilds
+the graph with the ordinary Panini ops, and compiles that source into a
+shared object with libgccjit (src/tensorml/jit_compiler.h). The compiled
+module exports panini_model_forward / panini_model_info, which Model calls.
+
+#include "tensorml/onnx.h"
+
+auto model = Panini::ONNX::load("resnet18.onnx"); // or a pre-generated .cpp
+std::vector<float> in(model->input_size());
+std::vector<float> out = model->infer(in);
+
+// or, into caller-owned buffers:
+model->forward(in.data(), out.data());
+
+Options go through Panini::CompileOptions (opt_level, include_dirs,
+extra_flags, verbose) on load_onnx / load_cpp_source / load_cpp_code.
+
+- Supported ONNX ops: Conv, BatchNormalization, Relu, Sigmoid, Gelu/Erf,
+  Add, Sub, Mul, Div, MatMul, Gemm, MaxPool, AveragePool, GlobalAveragePool,
+  ReduceMean, Transpose, Constant, and the shape-only ops Reshape, Flatten,
+  Squeeze, Unsqueeze and Identity. Float32 only.
+- WARNING: any other op is currently passed through as identity, with no
+  error or warning, so a model that uses one (Softmax, Concat, LayerNorm,
+  ...) loads fine and gives wrong outputs. Check your graph's op list
+  against the list above, or compare the output against a reference, as
+  examples/model_verifier does.
+- Backend: the generated code uses tensorETCuda when compiled under nvcc,
+  tensorETVulkan with -DUSE_VULKAN, and CPU tensorET otherwise.
+- Build requirements: link onnx.cpp and jit_compiler.cpp, libgccjit
+  (-lgccjit -ldl) and protobuf. The protobuf bindings are not checked in:
+  generate them into src/tensorml/generated/ (onnx.pb.h / onnx.pb.cc) with
+  protoc from ONNX's onnx.proto. See examples/model_verifier/Makefile for a
+  working build line.
+- Compiling a model takes some seconds.
+
+-------------------------------------------------------
+
+6.8 Sparse Matrices & Direct Solves (src/sparse/)
+
+Panini::Sparse::Csr<T, Idx = int32_t, Store = Cpu::HostStorage> is a
 compressed-sparse-row matrix (0-based, columns sorted within each row, no
 duplicates, fixed sparsity pattern with changeable values). It is not a
 tensorET, since almost every tensorET operation assumes dense layout;
@@ -37,7 +1059,7 @@ CUDA version (device arrays from the GPU pool). Copying between storages is
 a plain conversion: CsrCuda<double> d = host_csr;
 
 #include "sparse/sparse.h"   // (CUDA: include tensorCuda.h first if used)
-using namespace AXOS::Sparse;
+using namespace Panini::Sparse;
 
 CooBuilder<double> b(rows, cols);
 b.add(i, j, v);                     // duplicates are summed
@@ -63,7 +1085,7 @@ discards the cached transpose; call values_changed() if you keep a raw
 pointer across calls. Vector arguments must be in the same storage as the
 matrix.
 
-AXOS::Sparse::SparseLdlt<T, Idx, Store> factorizes A = P^T L D L^T P for
+Panini::Sparse::SparseLdlt<T, Idx, Store> factorizes A = P^T L D L^T P for
 symmetric A stored with both triangles:
 
 SparseLdlt<double, int32_t, Cuda::CudaStorage> ldl(Symmetry::Symmetric);
@@ -96,16 +1118,16 @@ The planned LP/MILP/QP solvers built on this are in src/solver/ROADMAP.md.
 
 -------------------------------------------------------
 
-2. Linear Programming (src/solver/)
+6.9 Linear Programming (src/solver/)
 
-AXOS::Solver solves
+Panini::Solver solves
     minimize c^T x + offset   subject to  row_lb <= A x <= row_ub,
                                           col_lb <=  x  <= col_ub
-with A a host Csr (see 1). Any bound may be +-Solver::kInf; equalities have
+with A a host Csr (see 6.8). Any bound may be +-Solver::kInf; equalities have
 row_lb == row_ub. A maximization problem is stored negated (maximize = true).
 
 #include "solver/solver.h"     // (CUDA: include tensorCuda.h first)
-using namespace AXOS::Solver;
+using namespace Panini::Solver;
 
 LpProblem p = read_mps_file("model.mps");      // or fill LpProblem by hand
 SolverOptions opt;
@@ -137,17 +1159,25 @@ Four methods, chosen with opt.method:
   very many iterations. The default variant is reflected Halpern PDHG with a
   fixed step size (opt.pdlp_halpern = true; 1.3-1.8x fewer iterations than the
   adaptive-step PDHG with averaging on most models, slower on some packing LPs).
-  opt.pdlp_polish = true reaches a tight tolerance by running to 1e-4 and then
-  solving a primal and a dual feasibility problem from that point (helps some
-  models, hurts others; off by default).
-- LpMethod::Simplex: a CPU dual simplex (sparse LU basis with hypersparse
-  FTRAN/BTRAN, dual steepest edge, bound flipping ratio test, artificial-bound
-  phase 1, Devex primal cleanup). Gives a basic solution, detects infeasibility
+  opt.pdlp_polish = true enables feasibility polishing (after cuPDLPx): PDLP runs
+  until the objective gap meets the tolerance while the residuals are still
+  loose (1e-4), then solves a primal feasibility problem (objective dropped) and a
+  dual feasibility problem (right-hand sides and bounds zeroed), each started from
+  that point. It helps some models (shell 0.5 -> 0.24 s, 80bau3b 3.9 -> 3.1 s,
+  irish-electricity on the GPU: time limit -> optimal) and hurts others (qap15
+  0.4 -> 1.0 s, 25fv47, e226), so it is off by default.
+  Infeasibility / unboundedness rays are accepted when their objective
+  improvement exceeds a margin (10x the tolerance) and their relative
+  violation is below 0.1 x the requested tolerance (at least 1e-8); on netlib
+  this certifies all 6 infeasible models.
+- LpMethod::Simplex: a CPU dual simplex (Markowitz LU basis with hypersparse
+  FTRAN/BTRAN and time-adaptive refactorization, dual steepest edge, bound
+  flipping ratio test, artificial-bound phase 1, Devex primal cleanup). Gives a basic solution, detects infeasibility
   and unboundedness, and solves all 25 netlib models. It is the method MILP will
   warm start (SimplexBasis).
 - LpMethod::Ipm: a primal-dual interior-point method (Mehrotra
   predictor-corrector) on a regularized augmented KKT system, factorized by
-  SparseLdlt (cuDSS on CUDA, AMD-ordered LDL^T on the CPU; see 1). It gives
+  SparseLdlt (cuDSS on CUDA, AMD-ordered LDL^T on the CPU; see 6.8). It gives
   high accuracy (1e-8 and better) in few iterations. It has no infeasibility
   or unboundedness certificates: a failed run reports NumericalError or
   IterationLimit. Its cost is dominated by the sparse factorization, so it is
@@ -158,18 +1188,40 @@ Four methods, chosen with opt.method:
   opt.ipm_max_iterations and opt.ipm_ordering (0: AMD, 1: nested dissection on
   the GPU) tune it. opt.crossover = true follows an optimal IPM run with a
   simplex started from the interior point, to return a basic solution.
-- LpMethod::Auto: if the predicted interior-point factorization is cheap, the
-  interior-point method, then the dual simplex, then PDLP. If it is expensive
-  (CPU only; predicted from the symbolic analysis), the dual simplex first for
-  a slice of the predicted interior-point time, then the interior-point method,
-  then PDLP. The time limit is shared. (Everything except PDLP alone runs
-  after presolve.)
+- LpMethod::Auto (concurrent, the default for Auto): the dual simplex runs on
+  one CPU thread while a second thread runs the interior-point method and then
+  PDLP on the storage's device (cuDSS / GPU PDLP with CudaStorage). The first
+  optimal result or infeasibility certificate stops the other thread. The
+  interior-point method is skipped when its factorization, predicted from a
+  symbolic analysis, would take more than 1/20 of the remaining time. The
+  device thread runs the interior-point method if its factorization is cheap,
+  otherwise PDLP for 30% of the predicted interior-point time first, then the
+  interior-point method, then PDLP. opt.pdlp_first (-1 auto: on for CUDA, off
+  for CPU; 1 / 0 force) starts problems with 50000 or more nonzeros with a PDLP
+  slice (2-8 s, 5% of the time limit): large wins where PDLP is the fast method
+  (qap15 CPU 11 -> 0.7 s, savsched1 CPU 23 -> 4 s) but 5-20 s lost where the
+  interior-point method wins.
+  opt.concurrent = false gives the older sequential, deterministic strategy
+  (IPM, simplex, PDLP in an order chosen from the same prediction). Everything
+  except PDLP alone runs after presolve.
+- Cancellation: opt.interrupt points to a StopFlag; every method polls it
+  (per iteration, and between supernodes of a CPU factorization) and returns
+  Status::Interrupted.
 
 "Optimal" means the tolerances in opt hold on the ORIGINAL problem and,
 additionally, LpSolution::error_bound <= 10 * eps_gap * (1 + |objective|),
 where error_bound = gap + ||dual residual|| ||x|| + ||primal residual|| ||y||.
 This is what stops a badly scaled model from being reported as optimal just
 because its residuals are small relative to ||c||.
+
+After postsolve, solve_lp checks the tolerances (with a factor 10 for round-off)
+on the ORIGINAL problem. If they fail it retries once with the conservative
+presolve reductions, within max(10 s, the time already used). If that does not
+verify either, the first result is returned with LpSolution::duals_verified =
+false: the primal point satisfies the tolerances (status Optimal) but the duals
+recovered through the presolve stack do not (chains of reductions can amplify
+interior-point round-off by many orders of magnitude). A result whose primal point
+also fails is reported as NumericalError.
 
 On the 25 netlib LPs shipped with the HiGHS repository: the dual simplex
 and Auto solve all 25 (19 optimal to 1e-7..1e-9 relative objective error,
@@ -180,7 +1232,9 @@ within 1.2x to 2.4x on the larger models (greenbea 5.6x). See
 benchmarks/solver/RESULTS.md.
 
 Other pieces: write_mps() (round-trips read_mps), Presolve (class; reduced()
-and postsolve()), compute_scaling/apply_scaling/unscale_solution, and
+and postsolve(); empty/redundant/forcing rows, fixed and dominated columns,
+singleton and doubleton reductions, implied-free column substitution,
+duplicate rows, parallel columns, with dual recovery), compute_scaling/apply_scaling/unscale_solution, and
 evaluate_solution(p, x, y) to check any candidate (x, y) on the host.
 MPS support: NAME, OBJSENSE, ROWS (extra N rows are dropped), COLUMNS with
 MARKER INTORG/INTEND, RHS, RANGES, and the bound types UP LO FX FR MI PL BV
@@ -192,3 +1246,171 @@ from tests/data). Benchmarks: make benchmark_lp; real instances:
 benchmarks/solver/fetch_netlib.sh, then build/run_mps --method ipm|pdlp|simplex|auto
 build/netlib/*.mps (compare with benchmarks/solver/netlib_reference.py, which
 needs highspy).
+
+-------------------------------------------------------
+
+7. Mobile Deployment (Android / JNI)
+
+Panini can run inference inside an Android app via the Vulkan backend.
+Vulkan is the only GPU backend available on Android (no CUDA), and Panini's
+Vulkan runtime doesn't depend on anything Android-specific beyond the JNI
+glue itself. tpbinding.cpp (examples/tpbinding/app/src/main/cpp/) is a
+worked example: a JNI shim
+around a Vulkan ResNet50 that loads weights from a safetensors file and
+classifies a batch of Android Bitmaps.
+
+The pattern has three JNI entry points:
+
+// 1. Set up the Vulkan runtime once, e.g. from Activity.onCreate.
+// shaderDir must point at the .spv files installed alongside the app
+// (see the shaders Makefile target for how those get built).
+Panini::Vulkan::g_vulkan_shader_prefix = shader_dir;
+Panini::Vulkan::Runtime::get();
+
+// 2. Load weights and fold BatchNorm into the preceding conv, once.
+auto net = std::make_unique<ResNet50<tensorETVulkan>>(1000);
+Panini::SafeTensors::load(path, *net);
+net->fold_weights();
+
+// 3. Per inference call: preprocess on the CPU, upload, forward, argmax.
+NoGradGuard no_grad;
+TrainingGuard training_off(false);
+
+tensorETVulkan<4, float> input({batch, 3, 224, 224});
+Panini::Vulkan::Runtime::get().begin_recording();
+Panini::Vulkan::Runtime::get().upload(input.storage_.mBuffer, cpu_data, bytes);
+
+auto x = wrap_non_owning<4, float, tensorETVulkan<4, float>>(input);
+auto logits = net->forward(x, /*train=*/false);
+Panini::Vulkan::Runtime::get().end_recording_and_submit();
+
+A few things worth calling out rather than discovering the hard way:
+
+- Preprocessing (bitmap -> normalized CHW float buffer) happens on the CPU
+  before upload; there's no on-device decode path. Match the mean/std you
+  trained with.
+- wrap_non_owning lets you hand a raw tensorETVulkan to tensorML without a
+  copy -- use it for the input tensor, not for anything you need autograd
+  to track (it's built with requires_grad = false implicitly via NoGradGuard
+  here).
+- Wrap inference in NoGradGuard and TrainingGuard(false); skipping either
+  means the forward pass builds an autograd graph and BatchNorm runs in
+  training mode, both of which you don't want on a mobile inference path.
+- Build .spv shaders ahead of time on your dev machine (the shaders
+  Makefile target) and ship them in the APK; there is no on-device slangc.
+
+-------------------------------------------------------
+
+8. Code Examples
+
+8.1 Heat Diffusion PDE Solver (examples/pulse-diffusion/main.cpp)
+
+This example solves the 1D pulse diffusion PDE:
+  du/dt = D * (d^2 u / d x^2)
+
+Using tensorET (CPU) or tensorETCuda (GPU). The excerpt below is the CPU
+path. GPU tensors have no writable element access (see 1.3), so under nvcc
+the real example replaces the time-stepping loop with its own CUDA kernel
+(runDiffusionGPU, operating on u.data / u_new.data):
+
+#include "tensorET.h"
+#include <iostream>
+#include <fstream>
+#include <cmath>
+
+#ifdef __CUDACC__
+#include "tensorCuda.h"
+template <int DIM, typename T> using TensorType = Panini::tensorETCuda<DIM, T>;
+#else
+template <int DIM, typename T> using TensorType = Panini::tensorET<DIM, T>;
+#endif
+
+// Run 1D Gaussian pulse diffusion
+TensorType<1, double> runDiffusion(double T_total, double D, double L) {
+    size_t nx = 1000;
+    size_t nt = 10000;
+    double dx = L / (nx - 1);
+    double dt = T_total / nt;
+    double alpha = D * dt / (dx * dx);
+    double sigma = L / 20.0;
+
+    // Set initial condition: Gaussian pulse
+    Panini::tensorET<1, double> cpu_u(nx);
+    for (size_t i = 0; i < nx; i++) {
+        double x = i * dx;
+        cpu_u(i) = std::exp(-(x - L / 2.0) * (x - L / 2.0) / (2.0 * sigma * sigma));
+    }
+
+    TensorType<1, double> u = cpu_u;
+    TensorType<1, double> u_new(nx);
+
+    // Finite difference time-stepping (CPU; see runDiffusionGPU for CUDA)
+    for (size_t n = 0; n < nt; n++) {
+        for (size_t i = 1; i < nx - 1; i++) {
+            u_new(i) = (1.0 - 2.0 * alpha) * u(i) + alpha * (u(i + 1) + u(i - 1));
+        }
+        u_new(0) = 0.0;
+        u_new(nx - 1) = 0.0;
+        std::swap(u, u_new);
+    }
+    return u;
+}
+
+The 2D version (gaussianPulse2D) logs spatial concentration over time into a
+2D tensor history TensorType<2, double>, which saveHeatmap writes out as a
+binary PPM heatmap image using the Viridis color map.
+
+8.2 Training an MLP on MNIST (examples/mnist/main.cpp)
+
+This example trains an MLP (784 -> 256 -> 128 -> 10) on MNIST digit data using
+tensorML:
+
+#include "tensorml.h"
+#include <iostream>
+
+using TensorType = Panini::tensorET<2, float>;
+using Var = Panini::tensorML<2, float, TensorType>;
+
+struct MLP : public Panini::Module<2, float, TensorType> {
+    Var W1, b1, W2, b2, W3, b3;
+
+    MLP()
+        : W1(Var::gaussian({256, 784}, 0.0f, 0.05f, true)),
+          b1(TensorType({256, 1}, 0.0f), true),
+          W2(Var::gaussian({128, 256}, 0.0f, 0.088f, true)),
+          b2(TensorType({128, 1}, 0.0f), true),
+          W3(Var::gaussian({10, 128}, 0.0f, 0.125f, true)),
+          b3(TensorType({10, 1}, 0.0f), true) {}
+
+    std::vector<Var*> parameters() override {
+        return { &W1, &b1, &W2, &b2, &W3, &b3 };
+    }
+
+    Var forward(const TensorType& in) const {
+        auto x  = Var::make_temp(in, false);
+        auto h1 = Panini::relu(Panini::matMul(W1, x) + b1);
+        auto h2 = Panini::relu(Panini::matMul(W2, h1) + b2);
+        return Panini::matMul(W3, h2) + b3;
+    }
+};
+
+int main() {
+    MLP model;
+    Panini::Adam optimizer(model.parameters(), 1e-3f);
+
+    // Dummy mini-batch (batch size 512, 784 features)
+    TensorType batch_data({784, 512}, 0.5f);
+    TensorType target_labels({10, 512}, 0.0f);
+
+    for (int epoch = 0; epoch < 15; ++epoch) {
+        optimizer.zero_grad();
+        
+        Var logits = model.forward(batch_data);
+        Var loss = Panini::cross_entropy_loss(logits, target_labels);
+        
+        loss.backward();
+        optimizer.step();
+
+        std::cout << "Epoch " << epoch << " Loss: " << loss.value(0) << std::endl;
+    }
+}

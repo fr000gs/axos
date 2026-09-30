@@ -22,7 +22,7 @@
 #include <omp.h>
 #endif
 
-namespace AXOS {
+namespace Panini {
 namespace Sparse {
 namespace dense {
 
@@ -179,68 +179,68 @@ syrk_d(int m, int k, const T *L, int ldl, const T *d, T *C, int ldc, T *work,
     if constexpr (std::is_same_v<T, double>) {
         packed::syrk_d_packed(m, k, L, ldl, d, C, ldc, allow_parallel);
         (void)work;
-        return;
-    }
-    // W = L * diag(d), tight (leading dimension m)
-    for (int p = 0; p < k; ++p) {
-        const T dp = d[p];
-        const T *lp = L + static_cast<size_t>(p) * ldl;
-        T *wp = work + static_cast<size_t>(p) * m;
-#pragma omp simd
-        for (int i = 0; i < m; ++i)
-            wp[i] = lp[i] * dp;
-    }
-    const int nblocks = (m + kNR - 1) / kNR;
-    auto column_block = [&](int jb) {
-        const int j0 = jb * kNR;
-        const int nr = std::min(kNR, m - j0);
-        // rows i >= j0 only (lower triangle), in tiles of kMR
-        for (int p0 = 0; p0 < k; p0 += kKC) {
-            const int kc = std::min(kKC, k - p0);
-            for (int i0 = j0; i0 < m; i0 += kMR) {
-                const int mr = std::min(kMR, m - i0);
-                T acc[kNR][kMR] = {};
-                if (mr == kMR && nr == kNR) {
-                    for (int p = 0; p < kc; ++p) {
-                        const T *lp = L + static_cast<size_t>(p0 + p) * ldl + i0;
-                        const T *wp = work + static_cast<size_t>(p0 + p) * m + j0;
-                        for (int c = 0; c < kNR; ++c) {
-                            const T w = wp[c];
-#pragma omp simd
-                            for (int r = 0; r < kMR; ++r)
-                                acc[c][r] += lp[r] * w;
+    } else {
+        // W = L * diag(d), tight (leading dimension m)
+        for (int p = 0; p < k; ++p) {
+            const T dp = d[p];
+            const T *lp = L + static_cast<size_t>(p) * ldl;
+            T *wp = work + static_cast<size_t>(p) * m;
+    #pragma omp simd
+            for (int i = 0; i < m; ++i)
+                wp[i] = lp[i] * dp;
+        }
+        const int nblocks = (m + kNR - 1) / kNR;
+        auto column_block = [&](int jb) {
+            const int j0 = jb * kNR;
+            const int nr = std::min(kNR, m - j0);
+            // rows i >= j0 only (lower triangle), in tiles of kMR
+            for (int p0 = 0; p0 < k; p0 += kKC) {
+                const int kc = std::min(kKC, k - p0);
+                for (int i0 = j0; i0 < m; i0 += kMR) {
+                    const int mr = std::min(kMR, m - i0);
+                    T acc[kNR][kMR] = {};
+                    if (mr == kMR && nr == kNR) {
+                        for (int p = 0; p < kc; ++p) {
+                            const T *lp = L + static_cast<size_t>(p0 + p) * ldl + i0;
+                            const T *wp = work + static_cast<size_t>(p0 + p) * m + j0;
+                            for (int c = 0; c < kNR; ++c) {
+                                const T w = wp[c];
+    #pragma omp simd
+                                for (int r = 0; r < kMR; ++r)
+                                    acc[c][r] += lp[r] * w;
+                            }
+                        }
+                    } else {
+                        for (int p = 0; p < kc; ++p) {
+                            const T *lp = L + static_cast<size_t>(p0 + p) * ldl + i0;
+                            const T *wp = work + static_cast<size_t>(p0 + p) * m + j0;
+                            for (int c = 0; c < nr; ++c)
+                                for (int r = 0; r < mr; ++r)
+                                    acc[c][r] += lp[r] * wp[c];
                         }
                     }
-                } else {
-                    for (int p = 0; p < kc; ++p) {
-                        const T *lp = L + static_cast<size_t>(p0 + p) * ldl + i0;
-                        const T *wp = work + static_cast<size_t>(p0 + p) * m + j0;
-                        for (int c = 0; c < nr; ++c)
-                            for (int r = 0; r < mr; ++r)
-                                acc[c][r] += lp[r] * wp[c];
+                    for (int c = 0; c < nr; ++c) {
+                        T *cc = C + static_cast<size_t>(j0 + c) * ldc + i0;
+                        for (int r = 0; r < mr; ++r)
+                            if (i0 + r >= j0 + c) cc[r] -= acc[c][r];
                     }
                 }
-                for (int c = 0; c < nr; ++c) {
-                    T *cc = C + static_cast<size_t>(j0 + c) * ldc + i0;
-                    for (int r = 0; r < mr; ++r)
-                        if (i0 + r >= j0 + c) cc[r] -= acc[c][r];
-                }
             }
+        };
+        const double flops = static_cast<double>(m) * m * k;
+        bool par = allow_parallel && flops > 2e6;
+    #ifdef _OPENMP
+        if (par && !omp_in_parallel()) {
+    #pragma omp parallel for schedule(dynamic, 1)
+            for (int jb = 0; jb < nblocks; ++jb)
+                column_block(jb);
+            return;
         }
-    };
-    const double flops = static_cast<double>(m) * m * k;
-    bool par = allow_parallel && flops > 2e6;
-#ifdef _OPENMP
-    if (par && !omp_in_parallel()) {
-#pragma omp parallel for schedule(dynamic, 1)
+    #endif
+        (void)par;
         for (int jb = 0; jb < nblocks; ++jb)
             column_block(jb);
-        return;
     }
-#endif
-    (void)par;
-    for (int jb = 0; jb < nblocks; ++jb)
-        column_block(jb);
 }
 
 // Factors the leading ns columns of the fs x fs column-major lower front F
@@ -250,13 +250,13 @@ syrk_d(int m, int k, const T *L, int ldl, const T *d, T *C, int ldc, T *work,
 //
 // sign[j] (may be null) is the expected pivot sign of column j (+1/-1/0);
 // with eps > 0 a pivot whose sign*value is below eps is replaced by
-// sign*eps. `check(j, value)` must return false for an unacceptable pivot;
+// sign*eps (or sign*repl when repl > 0). `check(j, value)` must return false for an unacceptable pivot;
 // factorization then stops and the failing column index is returned in
 // *fail (else -1). Returns the number of regularized pivots.
 template <typename T, typename CheckFn>
 size_t
 partial_ldlt(int fs, int ns, T *F, int ldf, T *d, const signed char *sign,
-    T eps, CheckFn &&check, int *fail, T *work, bool allow_parallel)
+    T eps, CheckFn &&check, int *fail, T *work, bool allow_parallel, T repl = T(0))
 {
     *fail = -1;
     size_t nreg = 0;
@@ -271,7 +271,7 @@ partial_ldlt(int fs, int ns, T *F, int ldf, T *d, const signed char *sign,
             T piv = col[c];
             if (sign && sign[c] != 0) {
                 const T sg = static_cast<T>(sign[c]);
-                if (!(sg * piv >= eps)) { piv = sg * eps; ++nreg; }
+                if (!(sg * piv >= eps)) { piv = sg * (repl > T(0) ? repl : eps); ++nreg; }
             }
             if (!check(c, piv)) { *fail = c; return nreg; }
             d[c] = piv;
@@ -332,4 +332,4 @@ partial_ldlt(int fs, int ns, T *F, int ldf, T *d, const signed char *sign,
 
 } // namespace dense
 } // namespace Sparse
-} // namespace AXOS
+} // namespace Panini
